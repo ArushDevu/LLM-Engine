@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -131,5 +132,38 @@ Tensor matmul_blocked(const Tensor& A, const Tensor& B) {
     Tensor C(A.rows, B.cols);
     gemm(A.rows, B.cols, A.cols, A.data.data(), A.cols,
          B.data.data(), B.cols, C.data.data(), C.cols);
+    return C;
+}
+
+// Each worker computes a disjoint, MR-aligned slab of rows of C with its own
+// packing buffers, so there is no shared mutable state and no synchronization
+// beyond the final join. The cost is that every worker packs all of B, which
+// is O(k*n) next to O(slab*k*n) compute; a shared packed B is a later step.
+Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
+    check_shapes(A, B);
+    const std::size_t m = A.rows, n = B.cols, k = A.cols;
+    Tensor C(m, n);
+    if (m == 0 || n == 0) return C;
+
+    if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
+    // Below one MC block per thread, spawning costs more than it saves.
+    const std::size_t max_useful = (m + MC - 1) / MC;
+    const std::size_t workers = std::min<std::size_t>(threads, max_useful);
+    std::size_t slab = (m + workers - 1) / workers;
+    slab = (slab + MR - 1) / MR * MR;
+
+    auto run = [&](std::size_t row0) {
+        const std::size_t rows = std::min(slab, m - row0);
+        gemm(rows, n, k, A.data.data() + row0 * k, k,
+             B.data.data(), n, C.data.data() + row0 * n, n);
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    std::size_t row0 = 0;
+    // The calling thread takes the last slab instead of idling in join().
+    for (; row0 + slab < m; row0 += slab) pool.emplace_back(run, row0);
+    run(row0);
+    for (auto& t : pool) t.join();
     return C;
 }

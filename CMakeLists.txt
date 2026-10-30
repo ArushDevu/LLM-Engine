@@ -9,8 +9,11 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+find_package(Threads REQUIRED)
+
 add_library(engine_core src/matmul.cpp)
 target_include_directories(engine_core PUBLIC src)
+target_link_libraries(engine_core PUBLIC Threads::Threads)
 if(MSVC)
   target_compile_options(engine_core PRIVATE /W4)
 else()

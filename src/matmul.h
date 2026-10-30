@@ -11,3 +11,7 @@ Tensor matmul_naive(const Tensor& A, const Tensor& B);
 // Cache-blocked, single-threaded. Packs A and B into contiguous panels and
 // runs a register-tiled micro-kernel over them (Goto/BLIS structure).
 Tensor matmul_blocked(const Tensor& A, const Tensor& B);
+
+// Blocked kernel split across threads by rows of C. threads == 0 means
+// std::thread::hardware_concurrency(). Small problems use fewer threads.
+Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads = 0);

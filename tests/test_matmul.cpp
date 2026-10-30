@@ -85,6 +85,21 @@ void test_against_reference(MatmulFn matmul) {
     }
 }
 
+// Thread counts that do and don't divide the row count evenly, plus more
+// threads than there are row blocks.
+void test_parallel_thread_counts() {
+    std::mt19937 rng(7);
+    Tensor A = random_tensor(301, 129, rng);
+    Tensor B = random_tensor(129, 47, rng);
+    const Tensor want = matmul_naive(A, B);
+    for (unsigned t : {1u, 2u, 3u, 5u, 64u, 0u}) {
+        if (!close_to(matmul_parallel(A, B, t), want, A.cols)) {
+            std::fprintf(stderr, "  mismatch with threads=%u\n", t);
+            CHECK(false);
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -94,6 +109,12 @@ int main() {
     test_known_values(matmul_blocked);
     test_shape_mismatch(matmul_blocked);
     test_against_reference(matmul_blocked);
+
+    auto parallel = [](const Tensor& A, const Tensor& B) { return matmul_parallel(A, B); };
+    test_known_values(parallel);
+    test_shape_mismatch(parallel);
+    test_against_reference(parallel);
+    test_parallel_thread_counts();
 
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
