@@ -84,8 +84,12 @@ void gemm(std::size_t m, std::size_t n, std::size_t k,
           const float* A, std::size_t lda,
           const float* B, std::size_t ldb,
           float* C, std::size_t ldc) {
-    std::vector<float> Bp(KC * NC);
-    std::vector<float> Ap(MC * KC);
+    // Size the buffers to the problem rather than the block caps: a fixed
+    // KC x NC buffer is 1 MB of zeroing per call, which dominates small inputs.
+    auto round_up = [](std::size_t x, std::size_t to) { return (x + to - 1) / to * to; };
+    const std::size_t kc_max = std::min(KC, k);
+    std::vector<float> Bp(kc_max * round_up(std::min(NC, n), NR));
+    std::vector<float> Ap(round_up(std::min(MC, m), MR) * kc_max);
 
     for (std::size_t jc = 0; jc < n; jc += NC) {
         const std::size_t nc = std::min(NC, n - jc);
