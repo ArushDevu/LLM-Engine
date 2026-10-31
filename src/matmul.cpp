@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -21,8 +22,17 @@ constexpr std::size_t NC = 1024;
 
 static_assert(MC % MR == 0 && NC % NR == 0, "blocks must be whole tiles");
 
+constexpr std::size_t ceil_div(std::size_t x, std::size_t d) { return (x + d - 1) / d; }
+constexpr std::size_t round_up(std::size_t x, std::size_t to) { return ceil_div(x, to) * to; }
+
+std::string shape_str(const Tensor& t) {
+    return std::to_string(t.rows) + "x" + std::to_string(t.cols);
+}
+
 void check_shapes(const Tensor& A, const Tensor& B) {
-    if (A.cols != B.rows) throw std::invalid_argument("matmul: shape mismatch");
+    if (A.cols == B.rows) return;
+    throw std::invalid_argument("matmul: inner dimensions differ (A is " + shape_str(A) +
+                                ", B is " + shape_str(B) + ")");
 }
 
 // Pack a kc x nc block of B into NR-wide column panels. Panel j holds
@@ -86,7 +96,6 @@ void gemm(std::size_t m, std::size_t n, std::size_t k,
           float* C, std::size_t ldc) {
     // Size the buffers to the problem rather than the block caps: a fixed
     // KC x NC buffer is 1 MB of zeroing per call, which dominates small inputs.
-    auto round_up = [](std::size_t x, std::size_t to) { return (x + to - 1) / to * to; };
     const std::size_t kc_max = std::min(KC, k);
     std::vector<float> Bp(kc_max * round_up(std::min(NC, n), NR));
     std::vector<float> Ap(round_up(std::min(MC, m), MR) * kc_max);
@@ -151,10 +160,8 @@ Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
 
     if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
     // Below one MC block per thread, spawning costs more than it saves.
-    const std::size_t max_useful = (m + MC - 1) / MC;
-    const std::size_t workers = std::min<std::size_t>(threads, max_useful);
-    std::size_t slab = (m + workers - 1) / workers;
-    slab = (slab + MR - 1) / MR * MR;
+    const std::size_t workers = std::min<std::size_t>(threads, ceil_div(m, MC));
+    const std::size_t slab = round_up(ceil_div(m, workers), MR);
 
     auto run = [&](std::size_t row0) {
         const std::size_t rows = std::min(slab, m - row0);
