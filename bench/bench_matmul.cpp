@@ -56,7 +56,8 @@ double median_seconds(F&& f, int reps) {
 }
 
 void print_cell(double secs, std::size_t n) {
-    const double gflops = 2.0 * n * n * n / secs / 1e9;
+    const double dim = static_cast<double>(n);
+    const double gflops = 2.0 * dim * dim * dim / secs / 1e9;
     std::printf(" | %9.2f %8.1f", secs * 1e3, gflops);
 }
 
