@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <random>
 #include <stdexcept>
+#include <string>
 
 #include "matmul.h"
 
@@ -10,16 +11,32 @@ namespace {
 
 int failures = 0;
 
+// Name of the kernel under test, printed with every failure so the output
+// says which implementation broke, not just which line.
+const char* current_kernel = "";
+
 #define CHECK(cond)                                                          \
     do {                                                                     \
         if (!(cond)) {                                                       \
-            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__,      \
-                         __LINE__, #cond);                                   \
+            std::fprintf(stderr, "%s:%d: [%s] CHECK failed: %s\n", __FILE__, \
+                         __LINE__, current_kernel, #cond);                   \
             ++failures;                                                      \
         }                                                                    \
     } while (0)
 
-template <class MatmulFn>
+using MatmulFn = Tensor (*)(const Tensor&, const Tensor&);
+
+struct Kernel {
+    const char* name;
+    MatmulFn fn;
+};
+
+const Kernel kKernels[] = {
+    {"naive", matmul_naive},
+    {"blocked", matmul_blocked},
+    {"parallel", [](const Tensor& A, const Tensor& B) { return matmul_parallel(A, B); }},
+};
+
 void test_known_values(MatmulFn matmul) {
     Tensor A(2, 3), B(3, 2);
     float v = 1.0f;
@@ -34,15 +51,18 @@ void test_known_values(MatmulFn matmul) {
     CHECK(C.at(1, 1) == 154.0f);
 }
 
-template <class MatmulFn>
+// The error should name both shapes so a caller can see what went wrong
+// without a debugger.
 void test_shape_mismatch(MatmulFn matmul) {
-    bool threw = false;
+    std::string message;
     try {
         matmul(Tensor(2, 3), Tensor(4, 2));
-    } catch (const std::invalid_argument&) {
-        threw = true;
+    } catch (const std::invalid_argument& e) {
+        message = e.what();
     }
-    CHECK(threw);
+    CHECK(!message.empty());
+    CHECK(message.find("2x3") != std::string::npos);
+    CHECK(message.find("4x2") != std::string::npos);
 }
 
 Tensor random_tensor(std::size_t rows, std::size_t cols, std::mt19937& rng) {
@@ -72,7 +92,6 @@ constexpr Shape kShapes[] = {
     {200, 513, 33},
 };
 
-template <class MatmulFn>
 void test_against_reference(MatmulFn matmul) {
     std::mt19937 rng(42);
     for (const Shape& s : kShapes) {
@@ -103,17 +122,15 @@ void test_parallel_thread_counts() {
 } // namespace
 
 int main() {
-    test_known_values(matmul_naive);
-    test_shape_mismatch(matmul_naive);
+    for (const Kernel& kernel : kKernels) {
+        current_kernel = kernel.name;
+        test_known_values(kernel.fn);
+        test_shape_mismatch(kernel.fn);
+        // Comparing the reference against itself proves nothing.
+        if (kernel.fn != matmul_naive) test_against_reference(kernel.fn);
+    }
 
-    test_known_values(matmul_blocked);
-    test_shape_mismatch(matmul_blocked);
-    test_against_reference(matmul_blocked);
-
-    auto parallel = [](const Tensor& A, const Tensor& B) { return matmul_parallel(A, B); };
-    test_known_values(parallel);
-    test_shape_mismatch(parallel);
-    test_against_reference(parallel);
+    current_kernel = "parallel";
     test_parallel_thread_counts();
 
     if (failures) {
