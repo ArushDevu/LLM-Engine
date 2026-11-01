@@ -1,10 +1,12 @@
 #include "matmul.h"
 
 #include <algorithm>
+#include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <vector>
+
+#include "thread_pool.h"
 
 namespace {
 
@@ -24,6 +26,29 @@ static_assert(MC % MR == 0 && NC % NR == 0, "blocks must be whole tiles");
 
 constexpr std::size_t ceil_div(std::size_t x, std::size_t d) { return (x + d - 1) / d; }
 constexpr std::size_t round_up(std::size_t x, std::size_t to) { return ceil_div(x, to) * to; }
+
+// Grow-only, cache-line-aligned scratch buffer. Packing writes every element
+// the micro-kernel later reads, so the memory is never zeroed, and once it has
+// grown to the working size a call does no allocation at all.
+class Scratch {
+public:
+    float* get(std::size_t n) {
+        if (n > cap_) {
+            buf_.reset(static_cast<float*>(
+                ::operator new(n * sizeof(float), std::align_val_t{kAlign})));
+            cap_ = n;
+        }
+        return buf_.get();
+    }
+
+private:
+    static constexpr std::size_t kAlign = 64;
+    struct Free {
+        void operator()(float* p) const { ::operator delete(p, std::align_val_t{kAlign}); }
+    };
+    std::unique_ptr<float, Free> buf_;
+    std::size_t cap_ = 0;
+};
 
 std::string shape_str(const Tensor& t) {
     return std::to_string(t.rows) + "x" + std::to_string(t.cols);
@@ -88,32 +113,32 @@ void micro_kernel(std::size_t kc, const float* __restrict Ap,
 }
 
 // C += A * B on raw row-major buffers with leading dimensions. C must be
-// initialized by the caller. Each call owns its packing buffers, so disjoint
-// row ranges of C can be computed concurrently.
+// initialized by the caller. Packing buffers are per thread, so disjoint row
+// ranges of C can be computed concurrently.
 void gemm(std::size_t m, std::size_t n, std::size_t k,
           const float* A, std::size_t lda,
           const float* B, std::size_t ldb,
           float* C, std::size_t ldc) {
-    // Size the buffers to the problem rather than the block caps: a fixed
-    // KC x NC buffer is 1 MB of zeroing per call, which dominates small inputs.
+    // Thread-local so pool workers keep their buffers warm across calls.
+    thread_local Scratch a_buf, b_buf;
     const std::size_t kc_max = std::min(KC, k);
-    std::vector<float> Bp(kc_max * round_up(std::min(NC, n), NR));
-    std::vector<float> Ap(round_up(std::min(MC, m), MR) * kc_max);
+    float* Bp = b_buf.get(kc_max * round_up(std::min(NC, n), NR));
+    float* Ap = a_buf.get(round_up(std::min(MC, m), MR) * kc_max);
 
     for (std::size_t jc = 0; jc < n; jc += NC) {
         const std::size_t nc = std::min(NC, n - jc);
         for (std::size_t pc = 0; pc < k; pc += KC) {
             const std::size_t kc = std::min(KC, k - pc);
-            pack_b(B + pc * ldb + jc, ldb, kc, nc, Bp.data());
+            pack_b(B + pc * ldb + jc, ldb, kc, nc, Bp);
 
             for (std::size_t ic = 0; ic < m; ic += MC) {
                 const std::size_t mc = std::min(MC, m - ic);
-                pack_a(A + ic * lda + pc, lda, mc, kc, Ap.data());
+                pack_a(A + ic * lda + pc, lda, mc, kc, Ap);
 
                 // Panel offsets: panel jr/NR starts at (jr/NR) * kc * NR = jr * kc.
                 for (std::size_t jr = 0; jr < nc; jr += NR) {
                     for (std::size_t ir = 0; ir < mc; ir += MR) {
-                        micro_kernel(kc, Ap.data() + ir * kc, Bp.data() + jr * kc,
+                        micro_kernel(kc, Ap + ir * kc, Bp + jr * kc,
                                      C + (ic + ir) * ldc + jc + jr, ldc,
                                      std::min(MR, mc - ir), std::min(NR, nc - jr));
                     }
@@ -148,33 +173,34 @@ Tensor matmul_blocked(const Tensor& A, const Tensor& B) {
     return C;
 }
 
-// Each worker computes a disjoint, MR-aligned slab of rows of C with its own
+// Each task computes a disjoint, MR-aligned slab of rows of C with its own
 // packing buffers, so there is no shared mutable state and no synchronization
-// beyond the final join. The cost is that every worker packs all of B, which
-// is O(k*n) next to O(slab*k*n) compute; a shared packed B is a later step.
+// beyond the pool's completion wait. The cost is that every task packs all of
+// B, which is O(k*n) next to O(slab*k*n) compute; a shared packed B is a later
+// step.
 Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
     check_shapes(A, B);
     const std::size_t m = A.rows, n = B.cols, k = A.cols;
     Tensor C(m, n);
     if (m == 0 || n == 0) return C;
 
-    if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
-    // Below one MC block per thread, spawning costs more than it saves.
-    const std::size_t workers = std::min<std::size_t>(threads, ceil_div(m, MC));
-    const std::size_t slab = round_up(ceil_div(m, workers), MR);
+    ThreadPool& pool = ThreadPool::global();
+    if (threads == 0) threads = pool.size();
+    // Below one MC block per task, splitting costs more than it saves, and
+    // more tasks than pool threads would only run back to back.
+    const std::size_t tasks =
+        std::min<std::size_t>({threads, pool.size(), ceil_div(m, MC)});
+    const std::size_t slab = round_up(ceil_div(m, tasks), MR);
 
-    auto run = [&](std::size_t row0) {
+    if (tasks == 1) {
+        gemm(m, n, k, A.data.data(), k, B.data.data(), n, C.data.data(), n);
+        return C;
+    }
+    pool.run(ceil_div(m, slab), [&](std::size_t t) {
+        const std::size_t row0 = t * slab;
         const std::size_t rows = std::min(slab, m - row0);
         gemm(rows, n, k, A.data.data() + row0 * k, k,
              B.data.data(), n, C.data.data() + row0 * n, n);
-    };
-
-    std::vector<std::thread> pool;
-    pool.reserve(workers);
-    std::size_t row0 = 0;
-    // The calling thread takes the last slab instead of idling in join().
-    for (; row0 + slab < m; row0 += slab) pool.emplace_back(run, row0);
-    run(row0);
-    for (auto& t : pool) t.join();
+    });
     return C;
 }

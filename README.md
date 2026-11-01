@@ -26,11 +26,12 @@ Square fp32 matmul, median of several runs after a warm-up
 
 | N    | Naive (i-k-j) | Blocked, 1 thread | Parallel, 16 threads |
 |------|---------------|-------------------|----------------------|
-| 512  | 26.6 GFLOPS   | 61.3 GFLOPS       | 77.4 GFLOPS          |
-| 1024 | 25.3 GFLOPS   | 63.9 GFLOPS       | 175.2 GFLOPS         |
-| 2048 | -             | 60.4 GFLOPS       | 253.6 GFLOPS         |
+| 512  | 26.3 GFLOPS   | 62.3 GFLOPS       | 217.0 GFLOPS         |
+| 1024 | 22.8 GFLOPS   | 55.8 GFLOPS       | 225.7 GFLOPS         |
+| 2048 | -             | 50.9 GFLOPS       | 309.1 GFLOPS         |
 
-Expect a few percent noise between runs on a laptop.
+Laptop numbers drift by 10-20% with temperature and power state, so compare
+changes by running old and new builds back to back, not against this table.
 
 ### How the CPU matmul works
 `src/matmul.cpp` follows the Goto/BLIS structure:
@@ -44,12 +45,14 @@ Expect a few percent noise between runs on a laptop.
    are padded to full tiles, so the hot loop has fixed trip counts and no edge
    branches; the compiler vectorizes it to FMA. Edges are handled only on the
    final store.
-4. **Threads.** `matmul_parallel` gives each thread a disjoint slab of rows of
-   C with its own packing buffers, so there's no locking.
+4. **Threads.** `matmul_parallel` splits C into disjoint slabs of rows and runs
+   them on a persistent pool (`src/thread_pool.h`), so a call costs a wake-up
+   rather than a thread spawn, and there's no locking around C.
+5. **No allocation in steady state.** Packing buffers are thread-local,
+   64-byte aligned and grow-only. Packing overwrites everything the kernel
+   reads, so they are never zeroed.
 
 Known limits and next steps:
-- Threads are spawned per call, so the parallel version loses to
-  single-threaded below ~256. A persistent thread pool fixes this.
 - Every thread packs all of B; sharing one packed copy would cut memory traffic.
 - The micro-kernel relies on auto-vectorization. Hand-written AVX-512
   intrinsics and a tuned tile shape are the next step toward peak.
