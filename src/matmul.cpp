@@ -173,11 +173,16 @@ Tensor matmul_blocked(const Tensor& A, const Tensor& B) {
     return C;
 }
 
-// Each task computes a disjoint, MR-aligned slab of rows of C with its own
-// packing buffers, so there is no shared mutable state and no synchronization
-// beyond the pool's completion wait. The cost is that every task packs all of
-// B, which is O(k*n) next to O(slab*k*n) compute; a shared packed B is a later
-// step.
+// C is cut into a grid of tiles: MR-aligned slabs of rows by NR-aligned slabs
+// of columns. Each task owns one tile and its own packing buffers, so there is
+// no shared mutable state and no synchronization beyond the pool's completion
+// wait.
+//
+// Rows are split first, since each row slab reuses its packed B the most.
+// When m is too small to occupy every thread -- m = 1 for each token during
+// generation -- the leftover threads go to column slabs. A column slab packs
+// only its own slice of B, so splitting by columns adds no packing work, while
+// splitting by rows makes every slab pack all of B again.
 Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
     check_shapes(A, B);
     const std::size_t m = A.rows, n = B.cols, k = A.cols;
@@ -186,21 +191,31 @@ Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
 
     ThreadPool& pool = ThreadPool::global();
     if (threads == 0) threads = pool.size();
-    // Below one MC block per task, splitting costs more than it saves, and
-    // more tasks than pool threads would only run back to back.
-    const std::size_t tasks =
-        std::min<std::size_t>({threads, pool.size(), ceil_div(m, MC)});
-    const std::size_t slab = round_up(ceil_div(m, tasks), MR);
+    // More tasks than pool threads would only run back to back.
+    const std::size_t workers = std::min<std::size_t>(threads, pool.size());
+    // Below one MC block of rows, or kMinCols columns, per task, splitting
+    // costs more than it saves.
+    constexpr std::size_t kMinCols = 4 * NR;
+    const std::size_t row_tasks = std::min(workers, ceil_div(m, MC));
+    const std::size_t col_tasks =
+        std::min(std::max<std::size_t>(1, workers / row_tasks), ceil_div(n, kMinCols));
+    const std::size_t row_slab = round_up(ceil_div(m, row_tasks), MR);
+    const std::size_t col_slab = round_up(ceil_div(n, col_tasks), NR);
+    const std::size_t row_tiles = ceil_div(m, row_slab);
+    const std::size_t col_tiles = ceil_div(n, col_slab);
 
-    if (tasks == 1) {
-        gemm(m, n, k, A.data.data(), k, B.data.data(), n, C.data.data(), n);
-        return C;
+    auto run_tile = [&](std::size_t t) {
+        const std::size_t row0 = (t / col_tiles) * row_slab;
+        const std::size_t col0 = (t % col_tiles) * col_slab;
+        gemm(std::min(row_slab, m - row0), std::min(col_slab, n - col0), k,
+             A.data.data() + row0 * k, k,
+             B.data.data() + col0, n,
+             C.data.data() + row0 * n + col0, n);
+    };
+    if (row_tiles * col_tiles == 1) {
+        run_tile(0);
+    } else {
+        pool.run(row_tiles * col_tiles, run_tile);
     }
-    pool.run(ceil_div(m, slab), [&](std::size_t t) {
-        const std::size_t row0 = t * slab;
-        const std::size_t rows = std::min(slab, m - row0);
-        gemm(rows, n, k, A.data.data() + row0 * k, k,
-             B.data.data(), n, C.data.data() + row0 * n, n);
-    });
     return C;
 }

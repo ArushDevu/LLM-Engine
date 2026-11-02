@@ -2,6 +2,11 @@
 //
 //   bench_matmul [size ...]      default sizes: 128 256 512 1024 2048
 //
+// With no sizes given, a second table times decode-shaped products: a few
+// rows of activations against a 4096 x 4096 weight matrix, as when generating
+// one token at a time. Those are bound by streaming B from memory, so the
+// table also reports B's bandwidth.
+//
 // Each measurement is the median of several timed runs after one warm-up
 // run, so a single preempted or cold-cache run doesn't move the number.
 
@@ -25,9 +30,9 @@ constexpr std::size_t kNaiveMaxSize = 1024;
 // Consumed after each run so the compiler can't drop the work.
 volatile float g_sink;
 
-Tensor random_tensor(std::size_t n, std::mt19937& rng) {
+Tensor random_tensor(std::size_t rows, std::size_t cols, std::mt19937& rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    Tensor t(n, n);
+    Tensor t(rows, cols);
     for (auto& x : t.data) x = dist(rng);
     return t;
 }
@@ -78,8 +83,8 @@ int main(int argc, char** argv) {
 
     std::mt19937 rng(0);
     for (std::size_t n : sizes) {
-        const Tensor A = random_tensor(n, rng);
-        const Tensor B = random_tensor(n, rng);
+        const Tensor A = random_tensor(n, n, rng);
+        const Tensor B = random_tensor(n, n, rng);
         const int reps = reps_for(n);
 
         std::printf("%6zu", n);
@@ -91,6 +96,23 @@ int main(int argc, char** argv) {
         print_cell(median_seconds([&] { return matmul_blocked(A, B); }, reps), n);
         print_cell(median_seconds([&] { return matmul_parallel(A, B); }, reps), n);
         std::printf("\n");
+        std::fflush(stdout);
+    }
+    if (argc > 1) return 0;
+
+    constexpr std::size_t kDim = 4096;
+    std::printf("\nm x %zu times %zu x %zu (parallel); cells are ms / GFLOPS / GB/s of B\n\n",
+                kDim, kDim, kDim);
+    std::printf("%6s | %9s %8s %8s\n", "m", "ms", "GFLOPS", "GB/s");
+    std::printf("-------+---------------------------\n");
+    const Tensor W = random_tensor(kDim, kDim, rng);
+    const double w_bytes = static_cast<double>(W.data.size() * sizeof(float));
+    for (std::size_t m : {std::size_t{1}, std::size_t{4}, std::size_t{16}, std::size_t{64}}) {
+        const Tensor X = random_tensor(m, kDim, rng);
+        const double secs = median_seconds([&] { return matmul_parallel(X, W); }, 15);
+        const double flops = 2.0 * static_cast<double>(m) * kDim * kDim;
+        std::printf("%6zu | %9.2f %8.1f %8.1f\n", m, secs * 1e3, flops / secs / 1e9,
+                    w_bytes / secs / 1e9);
         std::fflush(stdout);
     }
 }

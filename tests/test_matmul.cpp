@@ -90,6 +90,9 @@ constexpr Shape kShapes[] = {
     {1, 1, 1},    {1, 17, 1},    {3, 5, 7},      {4, 256, 16},
     {5, 257, 17}, {63, 300, 65}, {64, 255, 128}, {130, 70, 1030},
     {200, 513, 33},
+    // Decode-shaped: a few rows against a wide B, which matmul_parallel
+    // splits by columns, including widths that don't divide into NR.
+    {1, 300, 1030}, {2, 64, 4111}, {8, 513, 2049},
 };
 
 void test_against_reference(MatmulFn matmul) {
@@ -104,17 +107,21 @@ void test_against_reference(MatmulFn matmul) {
     }
 }
 
-// Thread counts that do and don't divide the row count evenly, plus more
-// threads than there are row blocks.
+// Thread counts that do and don't divide the work evenly, plus more threads
+// than there are tiles. The shapes exercise a row-only split, a column-only
+// split (m = 1) and a grid of both.
 void test_parallel_thread_counts() {
     std::mt19937 rng(7);
-    Tensor A = random_tensor(301, 129, rng);
-    Tensor B = random_tensor(129, 47, rng);
-    const Tensor want = matmul_naive(A, B);
-    for (unsigned t : {1u, 2u, 3u, 5u, 64u, 0u}) {
-        if (!close_to(matmul_parallel(A, B, t), want, A.cols)) {
-            std::fprintf(stderr, "  mismatch with threads=%u\n", t);
-            CHECK(false);
+    for (const Shape& s : {Shape{301, 129, 47}, Shape{1, 129, 1000}, Shape{70, 33, 900}}) {
+        Tensor A = random_tensor(s.m, s.k, rng);
+        Tensor B = random_tensor(s.k, s.n, rng);
+        const Tensor want = matmul_naive(A, B);
+        for (unsigned t : {1u, 2u, 3u, 5u, 64u, 0u}) {
+            if (!close_to(matmul_parallel(A, B, t), want, A.cols)) {
+                std::fprintf(stderr, "  mismatch at m=%zu k=%zu n=%zu with threads=%u\n",
+                             s.m, s.k, s.n, t);
+                CHECK(false);
+            }
         }
     }
 }

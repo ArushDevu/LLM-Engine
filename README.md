@@ -30,8 +30,18 @@ Square fp32 matmul, median of several runs after a warm-up
 | 1024 | 22.8 GFLOPS   | 55.8 GFLOPS       | 225.7 GFLOPS         |
 | 2048 | -             | 50.9 GFLOPS       | 309.1 GFLOPS         |
 
+Decode-shaped products, one to a few token rows times a 4096 x 4096 weight
+matrix, are bound by streaming the weights from memory rather than by FLOPs:
+
+| m (rows) | Time    | GFLOPS | Weight bandwidth |
+|----------|---------|--------|------------------|
+| 1        | 3.06 ms | 11.0   | 21.9 GB/s        |
+| 4        | 2.88 ms | 46.6   | 23.3 GB/s        |
+| 16       | 3.51 ms | 153.0  | 19.1 GB/s        |
+| 64       | 6.63 ms | 324.1  | 10.1 GB/s        |
+
 Laptop numbers drift by 10-20% with temperature and power state, so compare
-changes by running old and new builds back to back, not against this table.
+changes by running old and new builds back to back, not against these tables.
 
 ### How the CPU matmul works
 `src/matmul.cpp` follows the Goto/BLIS structure:
@@ -45,17 +55,24 @@ changes by running old and new builds back to back, not against this table.
    are padded to full tiles, so the hot loop has fixed trip counts and no edge
    branches; the compiler vectorizes it to FMA. Edges are handled only on the
    final store.
-4. **Threads.** `matmul_parallel` splits C into disjoint slabs of rows and runs
-   them on a persistent pool (`src/thread_pool.h`), so a call costs a wake-up
-   rather than a thread spawn, and there's no locking around C.
+4. **Threads.** `matmul_parallel` cuts C into a grid of disjoint tiles and
+   runs them on a persistent pool (`src/thread_pool.h`), so a call costs a
+   wake-up rather than a thread spawn, and there's no locking around C. Rows
+   are split first; when m is too small to occupy every thread (m = 1 per
+   generated token), the rest go to column slabs, which pack only their own
+   slice of B.
 5. **No allocation in steady state.** Packing buffers are thread-local,
    64-byte aligned and grow-only. Packing overwrites everything the kernel
    reads, so they are never zeroed.
 
 Known limits and next steps:
-- Every thread packs all of B; sharing one packed copy would cut memory traffic.
-- The micro-kernel relies on auto-vectorization. Hand-written AVX-512
-  intrinsics and a tuned tile shape are the next step toward peak.
+- Each row slab packs all of B; sharing one packed copy would cut memory
+  traffic for large m.
+- For m = 1, packing B is pure overhead. A dedicated GEMV that streams B
+  unpacked should get closer to DRAM bandwidth than the ~22 GB/s above.
+- The micro-kernel relies on auto-vectorization. A sweep of tile shapes
+  (4x16 up to 14x32, KC 128/256) moved single-thread speed by under 10%,
+  so the tile isn't the bottleneck; profile before hand-writing intrinsics.
 
 ## Build
 ```bash
