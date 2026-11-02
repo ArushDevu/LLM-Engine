@@ -90,9 +90,13 @@ constexpr Shape kShapes[] = {
     {1, 1, 1},    {1, 17, 1},    {3, 5, 7},      {4, 256, 16},
     {5, 257, 17}, {63, 300, 65}, {64, 255, 128}, {130, 70, 1030},
     {200, 513, 33},
-    // Decode-shaped: a few rows against a wide B, which matmul_parallel
-    // splits by columns, including widths that don't divide into NR.
-    {1, 300, 1030}, {2, 64, 4111}, {8, 513, 2049},
+    // Decode-shaped: a few rows against a wide B. m <= 4 takes the
+    // streaming split-K path (spans that don't divide k, k below one span);
+    // m = 5 and 8 take the column-split packed path.
+    {1, 300, 1030}, {2, 64, 4111}, {3, 1000, 70}, {4, 4097, 33}, {5, 200, 300},
+    {8, 513, 2049},
+    // Empty inner dimension: C must come back all zeros.
+    {1, 0, 5}, {6, 0, 3},
 };
 
 void test_against_reference(MatmulFn matmul) {
@@ -108,11 +112,12 @@ void test_against_reference(MatmulFn matmul) {
 }
 
 // Thread counts that do and don't divide the work evenly, plus more threads
-// than there are tiles. The shapes exercise a row-only split, a column-only
-// split (m = 1) and a grid of both.
+// than there are tiles. The shapes exercise a row-only split, the split-K
+// streaming path (m = 1 and 4) and a grid of rows by columns.
 void test_parallel_thread_counts() {
     std::mt19937 rng(7);
-    for (const Shape& s : {Shape{301, 129, 47}, Shape{1, 129, 1000}, Shape{70, 33, 900}}) {
+    for (const Shape& s : {Shape{301, 129, 47}, Shape{1, 1029, 1000}, Shape{4, 300, 77},
+                           Shape{70, 33, 900}}) {
         Tensor A = random_tensor(s.m, s.k, rng);
         Tensor B = random_tensor(s.k, s.n, rng);
         const Tensor want = matmul_naive(A, B);

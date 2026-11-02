@@ -31,14 +31,15 @@ Square fp32 matmul, median of several runs after a warm-up
 | 2048 | -             | 50.9 GFLOPS       | 309.1 GFLOPS         |
 
 Decode-shaped products, one to a few token rows times a 4096 x 4096 weight
-matrix, are bound by streaming the weights from memory rather than by FLOPs:
+matrix, are bound by streaming the weights from memory rather than by FLOPs.
+A parallel streaming read on this machine peaks at 51.7 GB/s.
 
 | m (rows) | Time    | GFLOPS | Weight bandwidth |
 |----------|---------|--------|------------------|
-| 1        | 3.06 ms | 11.0   | 21.9 GB/s        |
-| 4        | 2.88 ms | 46.6   | 23.3 GB/s        |
-| 16       | 3.51 ms | 153.0  | 19.1 GB/s        |
-| 64       | 6.63 ms | 324.1  | 10.1 GB/s        |
+| 1        | 1.48 ms | 22.7   | 45.5 GB/s        |
+| 4        | 1.87 ms | 71.9   | 35.9 GB/s        |
+| 16       | 3.08 ms | 174.3  | 21.8 GB/s        |
+| 64       | 6.06 ms | 354.2  | 11.1 GB/s        |
 
 Laptop numbers drift by 10-20% with temperature and power state, so compare
 changes by running old and new builds back to back, not against these tables.
@@ -61,6 +62,12 @@ changes by running old and new builds back to back, not against these tables.
    are split first; when m is too small to occupy every thread (m = 1 per
    generated token), the rest go to column slabs, which pack only their own
    slice of B.
+6. **Streaming path for m <= 4.** With so few rows, packing B only adds
+   memory traffic. Each task instead takes a contiguous range of B's rows,
+   reads them strictly in order into a private partial C that stays in
+   cache, and the partials are summed at the end (split-K). This is the only
+   split that reads a row-major B sequentially; splitting by columns gave
+   ~20 GB/s because each thread jumps 16 KB between short reads.
 5. **No allocation in steady state.** Packing buffers are thread-local,
    64-byte aligned and grow-only. Packing overwrites everything the kernel
    reads, so they are never zeroed.
@@ -68,8 +75,11 @@ changes by running old and new builds back to back, not against these tables.
 Known limits and next steps:
 - Each row slab packs all of B; sharing one packed copy would cut memory
   traffic for large m.
-- For m = 1, packing B is pure overhead. A dedicated GEMV that streams B
-  unpacked should get closer to DRAM bandwidth than the ~22 GB/s above.
+- Between m = 4 and m = 16 neither path reaches DRAM bandwidth. Storing
+  weights pre-packed (or transposed) at load time would let both paths read
+  B sequentially without per-call packing.
+- When B fits in L3 the packed path is ~20% faster than streaming at m = 4;
+  the cutoff is tuned for weights in DRAM.
 - The micro-kernel relies on auto-vectorization. A sweep of tile shapes
   (4x16 up to 14x32, KC 128/256) moved single-thread speed by under 10%,
   so the tile isn't the bottleneck; profile before hand-writing intrinsics.
