@@ -12,13 +12,29 @@ of the transformer is written by hand.
 ## Roadmap
 - [x] Tensor type + naive matmul with benchmark
 - [x] Multithreaded / cache-optimized CPU matmul
-- [ ] Load model weights (stories15M)
-- [ ] Full transformer forward pass on CPU
-- [ ] Text generation with sampling
+- [x] Load model weights (stories15M)
+- [x] Full transformer forward pass on CPU
+- [x] Text generation with sampling
+- [x] KV cache
+- [ ] Batched prompt prefill
 - [ ] CUDA kernels: matmul, softmax, RMSNorm, attention
-- [ ] KV cache
 - [ ] int8 quantization
 - [ ] Benchmarks vs llama.cpp
+
+## Running a model
+Checkpoints use the llama2.c format. To try the 15M-parameter TinyStories model:
+
+```
+mkdir models
+curl -L -o models/stories15M.bin https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+curl -L -o models/tokenizer.bin https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin
+cmake -S . -B build -G Ninja && cmake --build build
+build/generate models/stories15M.bin -t 0.8 -p 0.9 -i "One day, Tom found a"
+```
+
+`-t 0` is greedy; with no prompt it tells the familiar "Once upon a time,
+there was a little girl named Lily..." story. Text goes to stdout, load time
+and decode speed to stderr.
 
 ## Benchmarks
 Square fp32 matmul, median of several runs after a warm-up
@@ -41,6 +57,20 @@ A parallel streaming read on this machine peaks at 51.7 GB/s.
 | 16       | 3.08 ms | 174.3  | 21.8 GB/s        |
 | 64       | 6.06 ms | 354.2  | 11.1 GB/s        |
 
+Token generation with stories15M (dim 288, 6 layers, 32k vocab), greedy,
+256 positions:
+
+| Thread pool              | ms / token | tokens / s |
+|--------------------------|------------|------------|
+| Condvar wake per job     | 5.4-5.9    | 168-186    |
+| Spin, then sleep         | 2.04-2.12  | 472-491    |
+
+One token is 25 matmuls, most of them 6-40 us of work. A condition-variable
+wake-up costs ~100 us on Windows, so the old pool spent most of each token
+waking threads. Per token the model streams ~61 MB of weights (37 MB of it the
+classifier), a floor of ~1.2 ms at the measured 51.7 GB/s. The forward pass
+alone runs at ~1.9 ms.
+
 Laptop numbers drift by 10-20% with temperature and power state, so compare
 changes by running old and new builds back to back, not against these tables.
 
@@ -58,7 +88,10 @@ changes by running old and new builds back to back, not against these tables.
    final store.
 4. **Threads.** `matmul_parallel` cuts C into a grid of disjoint tiles and
    runs them on a persistent pool (`src/thread_pool.h`), so a call costs a
-   wake-up rather than a thread spawn, and there's no locking around C. Rows
+   wake-up rather than a thread spawn, and there's no locking around C.
+   Idle workers spin for a few hundred microseconds before sleeping, and
+   joining a job takes no lock, so back-to-back calls start in about a
+   microsecond. Rows
    are split first; when m is too small to occupy every thread (m = 1 per
    generated token), the rest go to column slabs, which pack only their own
    slice of B.
@@ -72,7 +105,31 @@ changes by running old and new builds back to back, not against these tables.
    64-byte aligned and grow-only. Packing overwrites everything the kernel
    reads, so they are never zeroed.
 
+### How the forward pass works
+`src/model.cpp` loads a llama2.c checkpoint and runs one token at a time:
+
+- **Weights stored transposed.** The file holds projections as (out x in);
+  they're stored (in x out) at load so `x * W` is a plain row-times-matrix
+  product, and the m = 1 streaming path reads each weight row once, in order.
+- **Fused projections.** q, k and v read the same input, as do the gate and
+  up projections, so each pair or triple is concatenated by columns: 4
+  matmuls per layer instead of 7, and fewer pool dispatches per token.
+- **KV cache.** Each position's rotated keys and values are kept per layer,
+  so a new token runs attention against the cache instead of recomputing the
+  prefix. Grouped-query attention maps each query head to its kv head.
+- **Tested against a reference.** `tests/test_model.cpp` writes small random
+  checkpoints (multi-head, grouped-query, multi-query; tied and separate
+  classifier) and checks every position's logits against a from-scratch,
+  double-precision implementation that reads the file's own layout.
+
 Known limits and next steps:
+- Prompts go through the model one token at a time. Running the whole
+  prompt as one m = n_prompt pass would turn it into proper GEMMs.
+- Decode is memory-bound: fp32 weights put the floor at ~1.2 ms/token here.
+  Smaller weight types (bf16, int8) cut it directly. Splitting the k = 288
+  products into more than 5 split-K tasks was slower: the partial sums cost
+  more than the extra bandwidth bought.
+- A tied classifier is stored twice, as the embedding and transposed.
 - Each row slab packs all of B; sharing one packed copy would cut memory
   traffic for large m.
 - Between m = 4 and m = 16 neither path reaches DRAM bandwidth. Storing
