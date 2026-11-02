@@ -25,20 +25,21 @@ Tensor rmsnorm(const Tensor& x, const std::vector<float>& weight, float eps) {
     return y;
 }
 
-void softmax_rows(Tensor& x) {
-    if (x.cols == 0) return;
-    for (std::size_t r = 0; r < x.rows; ++r) {
-        float* row = x.data.data() + r * x.cols;
-        const float max = *std::max_element(row, row + x.cols);
-        float sum = 0.0f;
-        for (std::size_t c = 0; c < x.cols; ++c) {
-            row[c] = std::exp(row[c] - max);
-            sum += row[c];
-        }
-        // sum >= 1: the max element contributes exp(0).
-        const float inv = 1.0f / sum;
-        for (std::size_t c = 0; c < x.cols; ++c) row[c] *= inv;
+void softmax(float* x, std::size_t n) {
+    if (n == 0) return;
+    const float max = *std::max_element(x, x + n);
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) {
+        x[i] = std::exp(x[i] - max);
+        sum += x[i];
     }
+    // sum >= 1: the max element contributes exp(0).
+    const float inv = 1.0f / sum;
+    for (std::size_t i = 0; i < n; ++i) x[i] *= inv;
+}
+
+void softmax_rows(Tensor& x) {
+    for (std::size_t r = 0; r < x.rows; ++r) softmax(x.data.data() + r * x.cols, x.cols);
 }
 
 void silu(Tensor& x) {

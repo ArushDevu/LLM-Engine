@@ -9,6 +9,7 @@ struct Tensor {
     std::size_t cols;
     std::vector<float> data;
 
+    Tensor() : rows(0), cols(0) {}
     Tensor(std::size_t r, std::size_t c) : rows(r), cols(c), data(r * c, 0.0f) {}
 
     float& at(std::size_t r, std::size_t c)       { return data[r * cols + c]; }

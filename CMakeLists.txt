@@ -30,7 +30,9 @@ else()
     $<$<BOOL:${ENGINE_WERROR}>:-Werror>)
 endif()
 
-add_library(engine_core src/matmul.cpp src/ops.cpp src/thread_pool.cpp)
+add_library(engine_core
+  src/matmul.cpp src/model.cpp src/ops.cpp src/sampler.cpp src/thread_pool.cpp
+  src/tokenizer.cpp)
 target_include_directories(engine_core PUBLIC src)
 target_link_libraries(engine_core PUBLIC Threads::Threads PRIVATE engine_warnings)
 if(ENGINE_NATIVE AND NOT MSVC)
@@ -39,6 +41,9 @@ endif()
 
 add_executable(bench_matmul bench/bench_matmul.cpp)
 target_link_libraries(bench_matmul PRIVATE engine_core engine_warnings)
+
+add_executable(generate tools/generate.cpp)
+target_link_libraries(generate PRIVATE engine_core engine_warnings)
 
 enable_testing()
 add_executable(test_matmul tests/test_matmul.cpp)
@@ -52,3 +57,11 @@ add_test(NAME ops COMMAND test_ops)
 add_executable(test_thread_pool tests/test_thread_pool.cpp)
 target_link_libraries(test_thread_pool PRIVATE engine_core engine_warnings)
 add_test(NAME thread_pool COMMAND test_thread_pool)
+
+add_executable(test_model tests/test_model.cpp)
+target_link_libraries(test_model PRIVATE engine_core engine_warnings)
+add_test(NAME model COMMAND test_model)
+
+add_executable(test_tokenizer tests/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer PRIVATE engine_core engine_warnings)
+add_test(NAME tokenizer COMMAND test_tokenizer)

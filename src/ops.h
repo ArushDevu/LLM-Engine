@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <vector>
 
 #include "tensor.h"
@@ -10,8 +11,11 @@
 // column. Throws std::invalid_argument if weight.size() != x.cols.
 Tensor rmsnorm(const Tensor& x, const std::vector<float>& weight, float eps = 1e-5f);
 
-// In place: each row becomes exp(x - max) / sum(exp(x - max)). Subtracting
-// the row max keeps exp() from overflowing on large logits.
+// In place: x becomes exp(x - max) / sum(exp(x - max)). Subtracting the max
+// keeps exp() from overflowing on large logits. No-op for n == 0.
+void softmax(float* x, std::size_t n);
+
+// softmax() applied to each row.
 void softmax_rows(Tensor& x);
 
 // In place: x * sigmoid(x), the activation in Llama's feed-forward block.
