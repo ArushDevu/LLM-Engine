@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -40,6 +41,18 @@ void test_many_back_to_back_runs() {
     }
 }
 
+// Gaps longer than the spin let every worker fall asleep, so each job has to
+// wake them through the condition variable.
+void test_runs_after_workers_sleep() {
+    ThreadPool pool(4);
+    for (int round = 0; round < 10; ++round) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::atomic<int> hits{0};
+        pool.run(16, [&](std::size_t) { hits.fetch_add(1); });
+        CHECK(hits.load() == 16);
+    }
+}
+
 void test_single_thread_pool() {
     ThreadPool pool(1);
     CHECK(pool.size() == 1);
@@ -67,6 +80,7 @@ void test_concurrent_callers() {
 int main() {
     test_each_task_runs_once();
     test_many_back_to_back_runs();
+    test_runs_after_workers_sleep();
     test_single_thread_pool();
     test_concurrent_callers();
 

@@ -11,6 +11,9 @@
 // Fork-join pool with persistent workers. Threads are created once, so a
 // parallel call costs a wake-up instead of a thread spawn per worker; workers
 // also keep their thread-local scratch (e.g. GEMM packing buffers) warm.
+// Idle workers spin briefly before sleeping, so back-to-back jobs (one per
+// matmul while generating) start in about a microsecond rather than paying an
+// OS wake-up each.
 class ThreadPool {
 public:
     // threads counts the calling thread, so threads - 1 workers are created.
@@ -39,15 +42,19 @@ private:
     std::vector<std::thread> workers_;
     std::mutex run_mu_;  // one job at a time
 
-    std::mutex mu_;
-    std::condition_variable wake_;  // workers: a new job was posted
-    std::condition_variable done_;  // caller: tasks finished / workers idle
+    // See the protocol notes in thread_pool.cpp.
     const std::function<void(std::size_t)>* job_ = nullptr;
     std::size_t tasks_ = 0;
-    std::size_t remaining_ = 0;    // tasks not yet finished
-    std::size_t busy_ = 0;         // workers inside drain()
-    std::uint64_t generation_ = 0; // bumped per job so workers spot new work
-    bool stop_ = false;
+    std::atomic<std::uint64_t> generation_{0};  // odd while a job is written
+    std::atomic<std::size_t> busy_{0};          // workers inside drain()
+    std::atomic<std::size_t> next_{0};          // next task index to claim
+    std::atomic<std::size_t> remaining_{0};     // tasks not yet finished
+    std::atomic<bool> stop_{false};
 
-    std::atomic<std::size_t> next_{0};  // next task index to claim
+    // Sleeping, after a spin finds nothing to do.
+    std::mutex mu_;
+    std::condition_variable wake_;  // workers: a new job was posted
+    std::condition_variable done_;  // caller: the last task finished
+    std::atomic<unsigned> sleepers_{0};    // workers blocked on wake_
+    std::atomic<bool> caller_waiting_{false};
 };
