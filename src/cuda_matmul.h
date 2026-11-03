@@ -52,11 +52,26 @@ enum class GpuKernel {
 void matmul_cuda(const DeviceTensor& A, const DeviceTensor& B, DeviceTensor& C,
                  GpuKernel kernel = GpuKernel::automatic);
 
+// Neighbouring ops folded into a product, so a decode step launches fewer
+// kernels. The skinny kernel normalizes A while it reads it; the others run
+// the norm as a separate pass first. (Fusing SwiGLU the same way was tried
+// and dropped: recomputing silu in every column's load chain made the down
+// projection 5.6 us slower, against a 1.1 us kernel saved.)
+struct MatmulFusion {
+    // C += A x B instead of C = A x B: a residual add.
+    bool accumulate = false;
+    // Multiply rmsnorm(A) instead of A: each row of A scaled by
+    // 1 / sqrt(mean(row^2) + 1e-5) and by these k weights, as rmsnorm() in
+    // ops.h.
+    const float* rms_weight = nullptr;
+};
+
 // Same on raw device pointers: A is m x k, B k x n, C m x n, all dense and
-// row-major. Throws std::invalid_argument for skinny with m > 8 or more than
-// 2^31 elements in a matrix.
+// row-major. Throws std::invalid_argument for skinny with m > 8 or matrices
+// past 32-bit indexing.
 void matmul_cuda(std::size_t m, std::size_t n, std::size_t k, const float* A, const float* B,
-                 float* C, GpuKernel kernel = GpuKernel::automatic);
+                 float* C, GpuKernel kernel = GpuKernel::automatic,
+                 const MatmulFusion& fusion = {});
 
 // Bumped whenever matmul_cuda() reallocates its internal split-K scratch. A
 // CUDA graph captured before the bump points at freed memory and must be

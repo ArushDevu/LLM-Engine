@@ -20,7 +20,7 @@ of the transformer is written by hand.
 - [x] int8 weight quantization
 - [x] CUDA matmul kernels
 - [x] CUDA forward pass: weights, KV cache and activations on the GPU
-- [ ] Fused GPU kernels; int8 on the GPU
+- [ ] int8 weights on the GPU; faster GPU attention
 - [ ] Benchmarks vs llama.cpp
 
 ## Running a model
@@ -167,29 +167,50 @@ GCC build. Greedy and seeded sampled text are identical on GPU and CPU.
 |--------------------|--------------------|------------------|--------|
 | CPU, fp32          | 2.02               | 24 ms            | 81 ms  |
 | CPU, int8 (`-w q8`) | 0.99              | 21 ms            | 192 ms |
-| GPU, fp32 (`-d gpu`) | 0.65             | 5.8 ms           | 270 ms |
+| GPU, fp32 (`-d gpu`) | 0.61             | 5.9 ms           | 270 ms |
 
 `CudaTransformer` (`src/cuda_model.cu`) keeps the weights, KV cache and
 activations in GPU memory; a call uploads its position and token ids and
-downloads only the logits. Each layer runs RMSNorm, the fused qkv matmul,
-RoPE plus the cache write, attention (one block per head and row, scores in
-shared memory), the output projection, a residual add, RMSNorm, gate/up,
-SwiGLU, the down projection and another add.
+downloads only the logits. Each layer runs the qkv matmul with RMSNorm
+fused in, RoPE plus the cache write, attention (one block per head and row,
+scores in shared memory), the output projection with the residual add fused
+in, gate/up with RMSNorm fused in, SwiGLU, and the down projection with the
+second residual add.
 
-That is ~100 kernels per token, and a launch costs 14-19 us of host time on
+Unfused that was ~100 kernels per token, and a launch costs 14-19 us of host time on
 this Windows driver, so launched one by one a token took 2.15 ms (one run),
 almost all of it launch overhead. The first decode step is instead captured
-into a CUDA graph and replayed with one launch per token: 0.65 ms. Kernels
+into a CUDA graph and replayed with one launch per token: 0.64 ms. Kernels
 read the position and token from device memory, so one graph serves every
 position; it is captured again only if a buffer it points at moves
 (activation buffers are grow-only, and the matmul's split-K scratch reports
 a generation).
 
-The weights alone take ~0.36 ms to stream at 170 GB/s; the other ~0.3 ms is
-the graph's ~100 dependent kernels, each a few microseconds of work. Fusing
-RMSNorm, RoPE and the residual adds into neighbouring kernels is the next
-step, then int8 weights on the GPU. Attention keeps a row's scores in
-shared memory, which caps seq_len at ~12k.
+Then fusion, measured per kernel with Nsight Systems (graph nodes traced
+individually) and kept only where the product's extra cost was below the
+kernel it removed:
+
+| Fused into the matmul          | Matmul cost | Kernel removed | Kept |
+|--------------------------------|-------------|----------------|------|
+| RMSNorm (qkv, gate/up)         | +0.6 us     | 1.7 us         | yes  |
+| RMSNorm (classifier)           | +0 to 2 us  | 1.7 us         | yes  |
+| Residual add (out, down)       | ~0          | 0.8 us         | yes  |
+| SwiGLU (down projection)       | +5.6 us     | 1.1 us         | no   |
+
+The skinny kernel normalizes A as it reads it, each block first computing
+the row's scale; the add becomes `C += A x B` (`MatmulFusion`). Kernels per
+token went from 92.6 to 67.7, GPU time from 504 to 478 us, and decode from
+0.640 to 0.607 ms (medians of seven interleaved runs; text unchanged).
+Splitting attention's weighted sum across all 256 threads was also tried
+and was slower (11.9 vs 9.8 us per call), so attention is unchanged.
+
+Where the 0.61 ms goes now: 213 us is the classifier and 160 us the layer
+matmuls, all reading weights at ~170 GB/s, so ~0.37 ms is the fp32 floor;
+attention is 58 us (6 blocks on 20 SMs, latency-bound); the rest is the
+small kernels and the gaps between ~68 graph nodes. int8 weights on the
+GPU would cut the floor, and splitting attention over positions would fill
+the GPU. Attention keeps a row's scores in shared memory, which caps
+seq_len at ~12k.
 
 ### How the CPU matmul works
 `src/matmul.cpp` follows the Goto/BLIS structure:

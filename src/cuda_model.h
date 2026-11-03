@@ -13,7 +13,7 @@ struct CUgraphExec_st;  // cudaGraphExec_t, without including the CUDA headers
 // as Transformer, and the same results up to float rounding. Built only with
 // -DENGINE_CUDA=ON; not safe to use from several host threads at once.
 //
-// A decode step is ~100 small kernels, and on Windows each launch costs
+// A decode step is ~70 small kernels, and on Windows each launch costs
 // ~15 us of host time, several times the work. So the first forward()
 // captures the whole one-token step into a CUDA graph, and later calls
 // replay it with one launch. Kernels read the position and token from device
@@ -57,8 +57,8 @@ private:
 
     // Activations, rows_ rows each, grow-only; only the first n are used.
     std::size_t rows_ = 0, own_generation_ = 0;
-    DeviceTensor x_, xn_, qkv_, att_, proj_, gu_, hb_;
-    DeviceTensor last_, logits_dev_;  // 1 x dim, 1 x vocab_size
+    DeviceTensor x_, qkv_, att_, gu_, hb_;
+    DeviceTensor logits_dev_;  // 1 x vocab_size
 
     // Pinned host buffers, so the copies can be graph nodes. feed is
     // [pos, tokens...]; feed_dev_ is its device copy.

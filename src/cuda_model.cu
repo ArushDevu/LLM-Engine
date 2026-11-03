@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "cuda_check.h"
+#include "cuda_util.cuh"
 
 namespace {
 
@@ -15,28 +15,6 @@ constexpr int kThreads = 256;  // every kernel here; a multiple of the warp size
 int ceil_div(std::size_t x, int d) { return static_cast<int>((x + d - 1) / d); }
 
 void check_launch() { cuda_check(cudaGetLastError(), "launch"); }
-
-struct Sum {
-    __device__ float operator()(float a, float b) const { return a + b; }
-};
-struct Max {
-    __device__ float operator()(float a, float b) const { return fmaxf(a, b); }
-};
-
-// Reduces v across the block; every thread gets the result. identity pads
-// the second, cross-warp stage.
-template <class Op>
-__device__ float block_reduce(float v, Op op, float identity) {
-    __shared__ float part[32];
-    for (int o = 16; o > 0; o >>= 1) v = op(v, __shfl_xor_sync(0xffffffffu, v, o));
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    __syncthreads();  // a previous call may still be reading part
-    if (lane == 0) part[warp] = v;
-    __syncthreads();
-    v = lane < int(blockDim.x / 32) ? part[lane] : identity;
-    for (int o = 16; o > 0; o >>= 1) v = op(v, __shfl_xor_sync(0xffffffffu, v, o));
-    return v;
-}
 
 // The kernels below read the call's first position from feed[0] and its
 // token ids from feed[1..n], in device memory, so a captured graph is valid
@@ -47,17 +25,6 @@ __global__ void embed(int dim, const int* feed, const float* table, float* x) {
     const float* src = table + static_cast<std::size_t>(feed[1 + blockIdx.x]) * dim;
     float* dst = x + static_cast<std::size_t>(blockIdx.x) * dim;
     for (int j = threadIdx.x; j < dim; j += blockDim.x) dst[j] = src[j];
-}
-
-// y = x / sqrt(mean(x^2) + eps) * w, one block per row.
-__global__ void rmsnorm_rows(int dim, const float* x, const float* w, float* y) {
-    const float* in = x + static_cast<std::size_t>(blockIdx.x) * dim;
-    float* out = y + static_cast<std::size_t>(blockIdx.x) * dim;
-    float ss = 0.0f;
-    for (int j = threadIdx.x; j < dim; j += blockDim.x) ss += in[j] * in[j];
-    ss = block_reduce(ss, Sum{}, 0.0f);
-    const float scale = 1.0f / sqrtf(ss / float(dim) + 1e-5f);
-    for (int j = threadIdx.x; j < dim; j += blockDim.x) out[j] = in[j] * scale * w[j];
 }
 
 // For row blockIdx.y, fed at position feed[0] + blockIdx.y: rotates each
@@ -96,7 +63,9 @@ __global__ void rope_and_cache(int qkv_cols, int dim, int kv_dim, int head_size,
 // feed[0] + i, attends to cached positions [0, feed[0] + i]. The query and
 // the scores live in shared memory (head_size + seq_len floats). Threads
 // split the positions for the scores and the head's dimensions for the
-// weighted sum of values, which reads each value row coalesced.
+// weighted sum of values, which reads each value row coalesced. (Splitting
+// the weighted sum across all 256 threads in head_size-wide groups, with a
+// final reduction, was slower: 11.9 vs 9.8 us per call.)
 __global__ void attention(int qkv_cols, int dim, int kv_dim, int head_size, int group,
                           const int* feed, const float* qkv, const float* key_cache,
                           const float* value_cache, float* out) {
@@ -119,14 +88,14 @@ __global__ void attention(int qkv_cols, int dim, int kv_dim, int head_size, int 
         scores[t] = dot * scale;
         mx = fmaxf(mx, scores[t]);
     }
-    mx = block_reduce(mx, Max{}, -INFINITY);
+    mx = block_reduce(mx, MaxOp{}, -INFINITY);
     float sum = 0.0f;
     for (int t = threadIdx.x; t < n_ctx; t += blockDim.x) {
         scores[t] = expf(scores[t] - mx);
         sum += scores[t];
     }
     // block_reduce's barriers also make every score visible below.
-    const float inv = 1.0f / block_reduce(sum, Sum{}, 0.0f);
+    const float inv = 1.0f / block_reduce(sum, SumOp{}, 0.0f);
 
     float* oh = out + static_cast<std::size_t>(i) * dim + h * head_size;
     for (int d = threadIdx.x; d < head_size; d += blockDim.x) {
@@ -146,22 +115,33 @@ __global__ void swiglu(int rows, int hidden, const float* gu, float* hb) {
     hb[idx] = g / (1.0f + expf(-g)) * gu[r * 2 * hidden + hidden + c];
 }
 
-__global__ void add_into(int n, float* x, const float* y) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] += y[i];
-}
-
 DeviceTensor upload(const std::vector<float>& v) {
     Tensor t(1, v.size());
     t.data = v;
     return DeviceTensor(t);
 }
 
+MatmulFusion rms(const DeviceTensor& weight) {
+    MatmulFusion f;
+    f.rms_weight = weight.data();
+    return f;
+}
+
+MatmulFusion residual() {
+    MatmulFusion f;
+    f.accumulate = true;
+    return f;
+}
+
+// Shared memory for attention: the query and the scores.
+std::size_t attention_smem(const Config& c) {
+    return (c.head_size() + c.seq_len) * sizeof(float);
+}
+
 } // namespace
 
 CudaTransformer::CudaTransformer(const Checkpoint& ckpt) : cfg_(ckpt.config) {
-    const std::size_t smem = (cfg_.head_size() + cfg_.seq_len) * sizeof(float);
-    if (smem > 48 * 1024)
+    if (const std::size_t smem = attention_smem(cfg_); smem > 48 * 1024)
         throw std::runtime_error("CudaTransformer: seq_len " + std::to_string(cfg_.seq_len) +
                                  " needs " + std::to_string(smem) +
                                  " bytes of attention scores, more than 48 KB");
@@ -180,7 +160,6 @@ CudaTransformer::CudaTransformer(const Checkpoint& ckpt) : cfg_(ckpt.config) {
     rope_tables(cfg_, cos, sin);
     rope_cos_ = upload(cos);
     rope_sin_ = upload(sin);
-    last_ = DeviceTensor(1, cfg_.dim);
     logits_dev_ = DeviceTensor(1, cfg_.vocab_size);
     logits_.resize(cfg_.vocab_size);
     const std::size_t feed_bytes = (cfg_.seq_len + 1) * sizeof(int);
@@ -202,10 +181,8 @@ void CudaTransformer::reserve_rows(std::size_t n) {
     if (n <= rows_) return;
     const std::size_t D = cfg_.dim, H = cfg_.hidden_dim;
     x_ = DeviceTensor(n, D);
-    xn_ = DeviceTensor(n, D);
     qkv_ = DeviceTensor(n, D + 2 * cfg_.kv_dim());
     att_ = DeviceTensor(n, D);
-    proj_ = DeviceTensor(n, D);
     gu_ = DeviceTensor(n, 2 * H);
     hb_ = DeviceTensor(n, H);
     rows_ = n;
@@ -275,6 +252,7 @@ void CudaTransformer::enqueue(std::size_t n) {
     const int Di = int(D), Hi = int(H), KVi = int(KV), hs = int(cfg_.head_size());
     const int rows = int(n);
     cudaStream_t stream = cudaStreamPerThread;
+    const GpuKernel kAuto = GpuKernel::automatic;
 
     cuda_check(cudaMemcpyAsync(feed_dev_, feed_host_, (n + 1) * sizeof(int),
                                cudaMemcpyHostToDevice, stream),
@@ -282,14 +260,15 @@ void CudaTransformer::enqueue(std::size_t n) {
     embed<<<rows, kThreads>>>(Di, feed_dev_, token_embedding_.data(), x_.data());
     check_launch();
 
-    const std::size_t smem = (cfg_.head_size() + cfg_.seq_len) * sizeof(float);
+    // Per layer: qkv = rmsnorm(x) Wqkv; RoPE and the cache write; attention;
+    // x += att Wo; gu = rmsnorm(x) W13; x += swiglu(gu) W2. The norms and
+    // residual adds are fused into the matmuls (MatmulFusion).
+    const std::size_t smem = attention_smem(cfg_);
     const int group = int(cfg_.n_heads / cfg_.n_kv_heads);
     for (std::size_t l = 0; l < cfg_.n_layers; ++l) {
         Layer& lw = layers_[l];
-
-        rmsnorm_rows<<<rows, kThreads>>>(Di, x_.data(), lw.rms_att.data(), xn_.data());
-        check_launch();
-        matmul_cuda(n, qkv_cols, D, xn_.data(), lw.wqkv.data(), qkv_.data());
+        matmul_cuda(n, qkv_cols, D, x_.data(), lw.wqkv.data(), qkv_.data(), kAuto,
+                    rms(lw.rms_att));
         rope_and_cache<<<dim3(ceil_div(D / 2 + KV / 2 + KV, kThreads), rows), kThreads>>>(
             int(qkv_cols), Di, KVi, hs, feed_dev_, rope_cos_.data(), rope_sin_.data(),
             qkv_.data(), key_cache_[l].data(), value_cache_[l].data());
@@ -298,24 +277,16 @@ void CudaTransformer::enqueue(std::size_t n) {
             int(qkv_cols), Di, KVi, hs, group, feed_dev_, qkv_.data(), key_cache_[l].data(),
             value_cache_[l].data(), att_.data());
         check_launch();
-        matmul_cuda(n, D, D, att_.data(), lw.wo.data(), proj_.data());
-        add_into<<<ceil_div(n * D, kThreads), kThreads>>>(rows * Di, x_.data(), proj_.data());
-        check_launch();
-
-        rmsnorm_rows<<<rows, kThreads>>>(Di, x_.data(), lw.rms_ffn.data(), xn_.data());
-        check_launch();
-        matmul_cuda(n, 2 * H, D, xn_.data(), lw.w13.data(), gu_.data());
+        matmul_cuda(n, D, D, att_.data(), lw.wo.data(), x_.data(), kAuto, residual());
+        matmul_cuda(n, 2 * H, D, x_.data(), lw.w13.data(), gu_.data(), kAuto, rms(lw.rms_ffn));
         swiglu<<<ceil_div(n * H, kThreads), kThreads>>>(rows, Hi, gu_.data(), hb_.data());
         check_launch();
-        matmul_cuda(n, D, H, hb_.data(), lw.w2.data(), proj_.data());
-        add_into<<<ceil_div(n * D, kThreads), kThreads>>>(rows * Di, x_.data(), proj_.data());
-        check_launch();
+        matmul_cuda(n, D, H, hb_.data(), lw.w2.data(), x_.data(), kAuto, residual());
     }
 
     // Only the last row's logits are returned.
-    rmsnorm_rows<<<1, kThreads>>>(Di, x_.data() + (n - 1) * D, rms_final_.data(), last_.data());
-    check_launch();
-    matmul_cuda(1, cfg_.vocab_size, D, last_.data(), wcls_.data(), logits_dev_.data());
+    matmul_cuda(1, cfg_.vocab_size, D, x_.data() + (n - 1) * D, wcls_.data(), logits_dev_.data(),
+                kAuto, rms(rms_final_));
     cuda_check(cudaMemcpyAsync(logits_host_, logits_dev_.data(), cfg_.vocab_size * sizeof(float),
                                cudaMemcpyDeviceToHost, stream),
                "download logits");

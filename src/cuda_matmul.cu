@@ -1,6 +1,6 @@
 #include "cuda_matmul.h"
 
-#include "cuda_check.h"
+#include "cuda_util.cuh"
 
 #include <algorithm>
 #include <stdexcept>
@@ -18,13 +18,15 @@ constexpr int ceil_div(std::size_t x, int d) { return static_cast<int>((x + d - 
 // Reference: thread (x, y) computes C[y][x]. Consecutive threads take
 // consecutive columns, so each step of the k loop reads B coalesced.
 __global__ void sgemm_naive(int m, int n, int k, const float* __restrict__ A,
-                            const float* __restrict__ B, float* __restrict__ C) {
+                            const float* __restrict__ B, float* __restrict__ C,
+                            bool accumulate) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
     if (row >= m || col >= n) return;
     float acc = 0.0f;
     for (int p = 0; p < k; ++p) acc += A[row * k + p] * B[p * n + col];
-    C[row * n + col] = acc;
+    float* c = C + row * n + col;
+    *c = accumulate ? *c + acc : acc;
 }
 
 // Shared-memory tiled SGEMM. A block computes a BM x BN tile of C, stepping
@@ -44,13 +46,15 @@ __global__ void sgemm_naive(int m, int n, int k, const float* __restrict__ A,
 // 64-row tiles split this way: 128-row tiles would be mostly padding there,
 // and too few blocks to fill the GPU. The slice bookkeeping is compiled out
 // of the unsplit kernel, where it cost 10% at N = 4096 (34.2 -> 37.6 ms).
+// accumulate (C += A x B) applies to the unsplit kernel's store; split
+// partials are added into C by sum_slices.
 constexpr int BN = 128, BK = 8, TN = 8;
 constexpr int kTiledThreads = 256;
 
 template <int BM, int TM, bool Split>
 __global__ void __launch_bounds__(kTiledThreads)
 sgemm_tiled(int m, int n, int k, int span, const float* __restrict__ A,
-            const float* __restrict__ B, float* __restrict__ out) {
+            const float* __restrict__ B, float* __restrict__ out, bool accumulate) {
     static_assert((BM / TM) * (BN / TN) == kTiledThreads, "one thread per sub-tile");
     __shared__ float As[BK][BM + 4];
     __shared__ float Bs[BK][BN];
@@ -97,7 +101,7 @@ sgemm_tiled(int m, int n, int k, int span, const float* __restrict__ A,
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
             const int c = col0 + tx + j * (BN / TN);
-            if (c < n) C[r * n + c] = acc[i][j];
+            if (c < n) C[r * n + c] = accumulate ? C[r * n + c] + acc[i][j] : acc[i][j];
         }
     }
 }
@@ -109,13 +113,29 @@ sgemm_tiled(int m, int n, int k, int span, const float* __restrict__ A,
 // columns alone are too few threads to keep enough loads in flight, so k is
 // split across blockIdx.y and the slices' partial sums are added by a second
 // kernel, in a fixed order (no atomics, so results are deterministic).
+//
+// With Norm, the skinny kernel also applies MatmulFusion's RMSNorm while it
+// reads A, so a decode step needs no separate norm kernel: each block first
+// computes its rows' scales over all of k (A is at most 8 rows), which cost
+// +0.6 us on a 5-10 us product against a 1.7 us kernel saved.
 constexpr int kSkinnyMaxRows = 8;
 constexpr int kSkinnyThreads = 256;
 
-template <int M>
+template <int M, bool Norm>
 __global__ void __launch_bounds__(kSkinnyThreads)
-sgemm_skinny(int n, int k, int span, const float* __restrict__ A, const float* __restrict__ B,
-             float* __restrict__ out) {
+sgemm_skinny(int n, int k, int span, const float* __restrict__ A,
+             const float* __restrict__ rms_weight, const float* __restrict__ B,
+             float* __restrict__ out, bool accumulate) {
+    // Before any thread drops out: block_reduce needs the whole block.
+    [[maybe_unused]] float scale[M];
+    if constexpr (Norm) {
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float ss = 0.0f;
+            for (int j = threadIdx.x; j < k; j += blockDim.x) ss += A[r * k + j] * A[r * k + j];
+            scale[r] = 1.0f / sqrtf(block_reduce(ss, SumOp{}, 0.0f) / float(k) + kRmsEps);
+        }
+    }
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n) return;
     const int p0 = blockIdx.y * span, p1 = min(k, p0 + span);
@@ -123,43 +143,86 @@ sgemm_skinny(int n, int k, int span, const float* __restrict__ A, const float* _
     for (int p = p0; p < p1; ++p) {
         const float b = B[p * n + c];
 #pragma unroll
-        for (int r = 0; r < M; ++r) acc[r] += A[r * k + p] * b;
+        for (int r = 0; r < M; ++r) {
+            float a = A[r * k + p];
+            if constexpr (Norm) a = a * scale[r] * rms_weight[p];
+            acc[r] += a * b;
+        }
     }
 #pragma unroll
-    for (int r = 0; r < M; ++r) out[(blockIdx.y * M + r) * n + c] = acc[r];
+    for (int r = 0; r < M; ++r) {
+        float* o = out + (blockIdx.y * M + r) * n + c;
+        *o = accumulate ? *o + acc[r] : acc[r];
+    }
 }
 
-// C[i] = sum over slices s of partial[s * mn + i].
+// C[i] = sum over slices s of partial[s * mn + i], added to C[i] if
+// accumulate.
 __global__ void sum_slices(int mn, int slices, const float* __restrict__ partial,
-                           float* __restrict__ C) {
+                           float* __restrict__ C, bool accumulate) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= mn) return;
     float acc = 0.0f;
     for (int s = 0; s < slices; ++s) acc += partial[s * mn + i];
-    C[i] = acc;
+    C[i] = accumulate ? C[i] + acc : acc;
 }
 
-// Grow-only device scratch for split-K partial sums. Each growth bumps the
-// generation, since it moves the buffer.
+// The norm as a separate pass, for kernels that don't fuse it:
+// out = rmsnorm(A) * rms_weight, one block per row.
+__global__ void rmsnorm_rows(int k, const float* __restrict__ A,
+                             const float* __restrict__ rms_weight, float* __restrict__ out) {
+    const float* in = A + static_cast<std::size_t>(blockIdx.x) * k;
+    float* o = out + static_cast<std::size_t>(blockIdx.x) * k;
+    float ss = 0.0f;
+    for (int j = threadIdx.x; j < k; j += blockDim.x) ss += in[j] * in[j];
+    const float scale = 1.0f / sqrtf(block_reduce(ss, SumOp{}, 0.0f) / float(k) + kRmsEps);
+    for (int j = threadIdx.x; j < k; j += blockDim.x) o[j] = in[j] * scale * rms_weight[j];
+}
+
+// Grow-only device scratch: split-K partial sums, and A after a separate
+// norm pass. Each growth bumps the generation, since it moves a buffer.
 std::size_t g_scratch_generation = 0;
 
-float* partial_buffer(std::size_t floats) {
-    static float* buf = nullptr;
-    static std::size_t cap = 0;
-    if (floats > cap) {
-        if (buf) cuda_check(cudaFree(buf), "free partials");
-        cuda_check(cudaMalloc(&buf, floats * sizeof(float)), "alloc partials");
-        cap = floats;
-        ++g_scratch_generation;
+class Scratch {
+public:
+    float* get(std::size_t floats) {
+        if (floats > cap_) {
+            if (buf_) cuda_check(cudaFree(buf_), "free scratch");
+            cuda_check(cudaMalloc(&buf_, floats * sizeof(float)), "alloc scratch");
+            cap_ = floats;
+            ++g_scratch_generation;
+        }
+        return buf_;
     }
-    return buf;
+
+private:
+    float* buf_ = nullptr;
+    std::size_t cap_ = 0;
+};
+
+float* partial_buffer(std::size_t floats) {
+    static Scratch s;
+    return s.get(floats);
 }
 
-template <int M>
-void launch_skinny(int n, int k, int span, int slices, const float* A, const float* B,
-                   float* out) {
-    sgemm_skinny<M><<<dim3(ceil_div(n, kSkinnyThreads), slices), kSkinnyThreads>>>(n, k, span,
-                                                                                     A, B, out);
+float* norm_buffer(std::size_t floats) {
+    static Scratch s;
+    return s.get(floats);
+}
+
+template <bool Norm>
+void launch_skinny(int m, dim3 grid, int n, int k, int span, const float* A,
+                   const float* rms_weight, const float* B, float* out, bool accumulate) {
+    switch (m) {
+#define ENGINE_SKINNY_CASE(M)                                                                  \
+    case M:                                                                                    \
+        sgemm_skinny<M, Norm><<<grid, kSkinnyThreads>>>(n, k, span, A, rms_weight, B, out,     \
+                                                     accumulate);                              \
+        break;
+        ENGINE_SKINNY_CASE(1) ENGINE_SKINNY_CASE(2) ENGINE_SKINNY_CASE(3) ENGINE_SKINNY_CASE(4)
+        ENGINE_SKINNY_CASE(5) ENGINE_SKINNY_CASE(6) ENGINE_SKINNY_CASE(7) ENGINE_SKINNY_CASE(8)
+#undef ENGINE_SKINNY_CASE
+    }
 }
 
 int sm_count() {
@@ -173,34 +236,37 @@ int sm_count() {
 }
 
 template <int BM, int TM>
-void run_tiled(int m, int n, int k, int slices, const float* A, const float* B, float* C) {
+void run_tiled(int m, int n, int k, int slices, const float* A, const float* B, float* C,
+               bool accumulate) {
     const dim3 grid(ceil_div(n, BN), ceil_div(m, BM));
     const int span = ceil_div(std::size_t(ceil_div(k, slices)), BK) * BK;
     slices = ceil_div(k, span);
     if (slices == 1) {
-        sgemm_tiled<BM, TM, false><<<grid, kTiledThreads>>>(m, n, k, k, A, B, C);
+        sgemm_tiled<BM, TM, false><<<grid, kTiledThreads>>>(m, n, k, k, A, B, C, accumulate);
         return;
     }
     float* partial = partial_buffer(std::size_t(slices) * m * n);
     sgemm_tiled<BM, TM, true><<<dim3(grid.x, grid.y, slices), kTiledThreads>>>(m, n, k, span, A,
-                                                                               B, partial);
-    sum_slices<<<ceil_div(std::size_t(m) * n, 256), 256>>>(m * n, slices, partial, C);
+                                                                               B, partial, false);
+    sum_slices<<<ceil_div(std::size_t(m) * n, 256), 256>>>(m * n, slices, partial, C, accumulate);
 }
 
 // 32- or 64-row tiles, the smallest that m fills, with k split until there
 // are about 8 blocks per SM, each slice at least 256 deep.
-void run_tiled_split(int m, int n, int k, const float* A, const float* B, float* C) {
+void run_tiled_split(int m, int n, int k, const float* A, const float* B, float* C,
+                     bool accumulate) {
     const int rows = m <= 32 ? 32 : 64;
     const int blocks = ceil_div(n, BN) * ceil_div(std::size_t(m), rows);
     const int slices = std::max(1, std::min(ceil_div(8 * sm_count(), blocks), ceil_div(k, 256)));
     if (rows == 32) {
-        run_tiled<32, 2>(m, n, k, slices, A, B, C);
+        run_tiled<32, 2>(m, n, k, slices, A, B, C, accumulate);
     } else {
-        run_tiled<64, 4>(m, n, k, slices, A, B, C);
+        run_tiled<64, 4>(m, n, k, slices, A, B, C, accumulate);
     }
 }
 
-void run_skinny(int m, int n, int k, const float* A, const float* B, float* C) {
+void run_skinny(int m, int n, int k, const float* A, const float* rms_weight, const float* B,
+                float* C, bool accumulate) {
     // Aim for about 64 resident warps per SM over the whole grid, but keep
     // slices at least 32 rows of B deep so the partials stay a small
     // fraction of the traffic.
@@ -209,13 +275,17 @@ void run_skinny(int m, int n, int k, const float* A, const float* B, float* C) {
     const int span = ceil_div(k, slices);
     slices = ceil_div(k, span);
 
+    // With one slice the kernel writes C itself, accumulating if asked.
     float* out = slices == 1 ? C : partial_buffer(std::size_t(slices) * m * n);
-    using Launch = void (*)(int, int, int, int, const float*, const float*, float*);
-    static constexpr Launch kLaunch[kSkinnyMaxRows] = {
-        launch_skinny<1>, launch_skinny<2>, launch_skinny<3>, launch_skinny<4>,
-        launch_skinny<5>, launch_skinny<6>, launch_skinny<7>, launch_skinny<8>};
-    kLaunch[m - 1](n, k, span, slices, A, B, out);
-    if (slices > 1) sum_slices<<<ceil_div(std::size_t(m) * n, 256), 256>>>(m * n, slices, out, C);
+    const bool direct_accumulate = slices == 1 && accumulate;
+    const dim3 grid(ceil_div(n, kSkinnyThreads), slices);
+    if (rms_weight) {
+        launch_skinny<true>(m, grid, n, k, span, A, rms_weight, B, out, direct_accumulate);
+    } else {
+        launch_skinny<false>(m, grid, n, k, span, A, rms_weight, B, out, direct_accumulate);
+    }
+    if (slices > 1)
+        sum_slices<<<ceil_div(std::size_t(m) * n, 256), 256>>>(m * n, slices, out, C, accumulate);
 }
 
 } // namespace
@@ -266,40 +336,50 @@ void matmul_cuda(const DeviceTensor& A, const DeviceTensor& B, DeviceTensor& C,
 }
 
 void matmul_cuda(std::size_t m, std::size_t n, std::size_t k, const float* A, const float* B,
-                 float* C, GpuKernel kernel) {
-    const std::string shapes = "(A is " + std::to_string(m) + "x" + std::to_string(k) +
-                               ", B is " + std::to_string(k) + "x" + std::to_string(n) + ")";
+                 float* C, GpuKernel kernel, const MatmulFusion& fusion) {
+    auto shapes = [&] {
+        return "(A is " + std::to_string(m) + "x" + std::to_string(k) + ", B is " +
+               std::to_string(k) + "x" + std::to_string(n) + ")";
+    };
     if (kernel == GpuKernel::automatic) {
         kernel = m <= kSkinnyMaxRows ? GpuKernel::skinny
                  : m <= 64           ? GpuKernel::tiled_split
                                      : GpuKernel::tiled;
     }
     if (kernel == GpuKernel::skinny && m > kSkinnyMaxRows)
-        throw std::invalid_argument("matmul_cuda: skinny kernel takes at most 8 rows " + shapes);
+        throw std::invalid_argument("matmul_cuda: skinny kernel takes at most 8 rows " +
+                                    shapes());
     // Kernels index with int.
-    constexpr std::size_t kMaxElems = 1u << 31;
+    constexpr std::size_t kMaxElems = std::size_t{1} << 31;
     if (m * k >= kMaxElems || k * n >= kMaxElems || m * n >= kMaxElems)
-        throw std::invalid_argument("matmul_cuda: more than 2^31 elements " + shapes);
+        throw std::invalid_argument("matmul_cuda: more than 2^31 elements " + shapes());
     if (m == 0 || n == 0) return;
     if (k == 0) {
-        cuda_check(cudaMemsetAsync(C, 0, m * n * sizeof(float)), "memset");
+        if (!fusion.accumulate) cuda_check(cudaMemsetAsync(C, 0, m * n * sizeof(float)), "memset");
         return;
     }
 
     const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
+    const float* rms_weight = fusion.rms_weight;
+    if (rms_weight && kernel != GpuKernel::skinny) {
+        float* a = norm_buffer(m * k);
+        rmsnorm_rows<<<mi, 256>>>(ki, A, rms_weight, a);
+        A = a;
+        rms_weight = nullptr;
+    }
     switch (kernel) {
         case GpuKernel::naive:
-            sgemm_naive<<<dim3(ceil_div(n, 16), ceil_div(m, 16)), dim3(16, 16)>>>(mi, ni, ki, A,
-                                                                                   B, C);
+            sgemm_naive<<<dim3(ceil_div(n, 16), ceil_div(m, 16)), dim3(16, 16)>>>(
+                mi, ni, ki, A, B, C, fusion.accumulate);
             break;
         case GpuKernel::tiled:
-            run_tiled<128, 8>(mi, ni, ki, 1, A, B, C);
+            run_tiled<128, 8>(mi, ni, ki, 1, A, B, C, fusion.accumulate);
             break;
         case GpuKernel::tiled_split:
-            run_tiled_split(mi, ni, ki, A, B, C);
+            run_tiled_split(mi, ni, ki, A, B, C, fusion.accumulate);
             break;
         default:
-            run_skinny(mi, ni, ki, A, B, C);
+            run_skinny(mi, ni, ki, A, rms_weight, B, C, fusion.accumulate);
             break;
     }
     cuda_check(cudaGetLastError(), "launch");

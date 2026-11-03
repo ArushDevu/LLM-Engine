@@ -10,6 +10,7 @@
 
 #include "cuda_matmul.h"
 #include "matmul.h"
+#include "ops.h"
 
 namespace {
 
@@ -110,12 +111,63 @@ std::string invalid_argument_of(F&& f) {
     return "";
 }
 
+Tensor add(const Tensor& a, const Tensor& b) {
+    Tensor c = a;
+    for (std::size_t i = 0; i < c.data.size(); ++i) c.data[i] += b.data[i];
+    return c;
+}
+
+// Every MatmulFusion option on every kernel: in the skinny kernel the norm
+// is fused, elsewhere it runs as a separate pass first. Shapes
+// cover one and several k slices, and the skinny / split / tiled cutoffs.
+void test_fusion() {
+    std::mt19937 rng(9);
+    for (const Shape& s : {Shape{1, 288, 300}, Shape{3, 100, 70}, Shape{8, 513, 129},
+                           Shape{9, 64, 33}, Shape{70, 40, 130}}) {
+        const Tensor A = random_tensor(s.m, s.k, rng);
+        const Tensor B = random_tensor(s.k, s.n, rng);
+        const Tensor C0 = random_tensor(s.m, s.n, rng);
+        Tensor w_host = random_tensor(1, s.k, rng);
+        const std::vector<float> w = w_host.data;
+        const DeviceTensor dA(A), dB(B), dW(w_host);
+
+        struct Case {
+            const char* name;
+            MatmulFusion fusion;
+            Tensor want;
+        };
+        MatmulFusion acc, norm, norm_acc;
+        acc.accumulate = norm_acc.accumulate = true;
+        norm.rms_weight = norm_acc.rms_weight = dW.data();
+        const Tensor plain = matmul_naive(A, B);
+        const Tensor normed = matmul_naive(rmsnorm(A, w), B);
+        const Case cases[] = {
+            {"accumulate", acc, add(C0, plain)},
+            {"rms", norm, normed},
+            {"rms + accumulate", norm_acc, add(C0, normed)},
+        };
+        for (const Kernel& k : kKernels) {
+            if (s.m > k.max_m) continue;
+            for (const Case& c : cases) {
+                DeviceTensor dC(C0);
+                matmul_cuda(s.m, s.n, s.k, dA.data(), dB.data(), dC.data(), k.kernel, c.fusion);
+                if (!close_to(dC.download(), c.want, 2 * s.k)) {
+                    std::fprintf(stderr, "  [%s] %s mismatch at m=%zu k=%zu n=%zu\n", k.name,
+                                 c.name, s.m, s.k, s.n);
+                    CHECK(false);
+                }
+            }
+        }
+    }
+}
+
 void test_bad_shapes() {
     const std::string msg = invalid_argument_of([] { matmul_cuda(Tensor(2, 3), Tensor(4, 2)); });
     CHECK(msg.find("2x3") != std::string::npos && msg.find("4x2") != std::string::npos);
     CHECK(!invalid_argument_of([] {
                matmul_cuda(Tensor(9, 2), Tensor(2, 2), GpuKernel::skinny);
            }).empty());
+
 }
 
 } // namespace
@@ -127,6 +179,7 @@ int main() try {
     }
     test_against_reference();
     test_reuse();
+    test_fusion();
     test_bad_shapes();
     cuda_synchronize();
 
