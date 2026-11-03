@@ -9,6 +9,8 @@
 
 #include "matmul.h"
 #include "ops.h"
+#include "quant.h"
+#include "thread_pool.h"
 
 namespace {
 
@@ -104,6 +106,10 @@ void add_into(Tensor& x, const Tensor& y) {
     for (std::size_t i = 0; i < x.data.size(); ++i) x.data[i] += y.data[i];
 }
 
+void resize_rows(Tensor& t, std::size_t rows) {
+    if (t.rows != rows) t = Tensor(rows, t.cols);
+}
+
 } // namespace
 
 Checkpoint load_checkpoint(const std::string& path) {
@@ -156,10 +162,22 @@ Checkpoint load_checkpoint(const std::string& path) {
     return ckpt;
 }
 
-Transformer::Transformer(Checkpoint ckpt)
-    : cfg_(ckpt.config), w_(std::move(ckpt.weights)),
+Transformer::Transformer(Checkpoint ckpt, WeightType type)
+    : cfg_(ckpt.config), w_(std::move(ckpt.weights)), quantized_(type == WeightType::q8),
       x_(1, cfg_.dim), att_(1, cfg_.dim), hb_(1, cfg_.hidden_dim),
-      scores_(cfg_.seq_len), logits_(cfg_.vocab_size) {
+      logits_(cfg_.vocab_size) {
+    if (quantized_) {
+        // Quantize and free each fp32 matrix in turn, so peak memory stays
+        // near the fp32 model's.
+        auto take = [](Tensor& t) {
+            QTensor q = quantize_q8(t);
+            t = Tensor{};
+            return q;
+        };
+        for (LayerWeights& lw : w_.layers)
+            qlayers_.push_back({take(lw.wqkv), take(lw.wo), take(lw.w13), take(lw.w2)});
+        qcls_ = take(w_.wcls);
+    }
     for (std::size_t l = 0; l < cfg_.n_layers; ++l) {
         key_cache_.emplace_back(cfg_.seq_len, cfg_.kv_dim());
         value_cache_.emplace_back(cfg_.seq_len, cfg_.kv_dim());
@@ -179,74 +197,118 @@ Transformer::Transformer(Checkpoint ckpt)
     }
 }
 
-void Transformer::attention(std::size_t l, std::size_t n, const float* q, float* out) {
+void Transformer::attention(std::size_t l, std::size_t pos, const Tensor& qkv, Tensor& out) {
     const std::size_t hs = cfg_.head_size(), kv_dim = cfg_.kv_dim();
     const std::size_t group = cfg_.n_heads / cfg_.n_kv_heads;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hs));
     const float* K = key_cache_[l].data.data();
     const float* V = value_cache_[l].data.data();
-    for (std::size_t h = 0; h < cfg_.n_heads; ++h) {
-        const float* qh = q + h * hs;
+
+    // One task per (row, head): they share only read-only cache rows, and
+    // each writes its own slice of out.
+    auto run_head = [&](std::size_t task) {
+        const std::size_t i = task / cfg_.n_heads, h = task % cfg_.n_heads;
+        const std::size_t n = pos + i + 1;
+        thread_local std::vector<float> scores;
+        if (scores.size() < n) scores.resize(cfg_.seq_len);
+        const float* qh = qkv.data.data() + i * qkv.cols + h * hs;
         const std::size_t kv_off = (h / group) * hs;
         for (std::size_t t = 0; t < n; ++t) {
             const float* k = K + t * kv_dim + kv_off;
             float dot = 0.0f;
-            for (std::size_t i = 0; i < hs; ++i) dot += qh[i] * k[i];
-            scores_[t] = dot * scale;
+            for (std::size_t j = 0; j < hs; ++j) dot += qh[j] * k[j];
+            scores[t] = dot * scale;
         }
-        softmax(scores_.data(), n);
-        float* oh = out + h * hs;
+        softmax(scores.data(), n);
+        float* oh = out.data.data() + i * out.cols + h * hs;
         std::fill(oh, oh + hs, 0.0f);
         for (std::size_t t = 0; t < n; ++t) {
             const float* v = V + t * kv_dim + kv_off;
-            const float a = scores_[t];
-            for (std::size_t i = 0; i < hs; ++i) oh[i] += a * v[i];
+            const float a = scores[t];
+            for (std::size_t j = 0; j < hs; ++j) oh[j] += a * v[j];
         }
+    };
+    const std::size_t tasks = qkv.rows * cfg_.n_heads;
+    if (tasks == 1) {
+        run_head(0);
+    } else {
+        ThreadPool::global().run(tasks, run_head);
     }
 }
 
+Tensor Transformer::project(const Tensor& x, const Tensor& w, const QTensor& wq) const {
+    return quantized_ ? matmul_parallel(x, wq) : matmul_parallel(x, w);
+}
+
 const std::vector<float>& Transformer::forward(int token, std::size_t pos) {
-    if (token < 0 || static_cast<std::size_t>(token) >= cfg_.vocab_size)
-        throw std::out_of_range("forward: token " + std::to_string(token) + " outside vocab");
-    if (pos >= cfg_.seq_len || pos > filled_)
-        throw std::out_of_range("forward: position " + std::to_string(pos) + " with " +
+    return run(&token, 1, pos);
+}
+
+const std::vector<float>& Transformer::prefill(const std::vector<int>& tokens, std::size_t pos) {
+    if (tokens.empty()) throw std::invalid_argument("prefill: no tokens");
+    return run(tokens.data(), tokens.size(), pos);
+}
+
+const std::vector<float>& Transformer::run(const int* tokens, std::size_t n, std::size_t pos) {
+    for (std::size_t i = 0; i < n; ++i) {
+        if (tokens[i] < 0 || static_cast<std::size_t>(tokens[i]) >= cfg_.vocab_size)
+            throw std::out_of_range("forward: token " + std::to_string(tokens[i]) +
+                                    " outside vocab");
+    }
+    if (pos + n > cfg_.seq_len || pos > filled_)
+        throw std::out_of_range("forward: positions " + std::to_string(pos) + ".." +
+                                std::to_string(pos + n - 1) + " with " +
                                 std::to_string(filled_) + " cached of " +
                                 std::to_string(cfg_.seq_len));
 
     const std::size_t D = cfg_.dim, H = cfg_.hidden_dim, KV = cfg_.kv_dim();
     const std::size_t half = cfg_.head_size() / 2;
-    const float* cos = rope_cos_.data() + pos * half;
-    const float* sin = rope_sin_.data() + pos * half;
+    resize_rows(x_, n);
+    resize_rows(att_, n);
+    resize_rows(hb_, n);
 
-    const float* emb = w_.token_embedding.data.data() + static_cast<std::size_t>(token) * D;
-    std::copy(emb, emb + D, x_.data.begin());
+    for (std::size_t i = 0; i < n; ++i) {
+        const float* emb = w_.token_embedding.data.data() + static_cast<std::size_t>(tokens[i]) * D;
+        std::copy(emb, emb + D, x_.data.begin() + static_cast<std::ptrdiff_t>(i * D));
+    }
 
+    static const QuantLayer kNoQuant;
     for (std::size_t l = 0; l < cfg_.n_layers; ++l) {
         const LayerWeights& lw = w_.layers[l];
+        const QuantLayer& ql = quantized_ ? qlayers_[l] : kNoQuant;
 
-        Tensor qkv = matmul_parallel(rmsnorm(x_, lw.rms_att), lw.wqkv);
-        float* q = qkv.data.data();
-        float* k = q + D;
-        float* v = k + KV;
-        rope(q, cfg_.n_heads, cfg_.head_size(), cos, sin);
-        rope(k, cfg_.n_kv_heads, cfg_.head_size(), cos, sin);
-        std::copy(k, k + KV, key_cache_[l].data.begin() + static_cast<std::ptrdiff_t>(pos * KV));
-        std::copy(v, v + KV, value_cache_[l].data.begin() + static_cast<std::ptrdiff_t>(pos * KV));
+        Tensor qkv = project(rmsnorm(x_, lw.rms_att), lw.wqkv, ql.wqkv);
+        for (std::size_t i = 0; i < n; ++i) {
+            float* q = qkv.data.data() + i * qkv.cols;
+            float* k = q + D;
+            float* v = k + KV;
+            const float* cos = rope_cos_.data() + (pos + i) * half;
+            const float* sin = rope_sin_.data() + (pos + i) * half;
+            rope(q, cfg_.n_heads, cfg_.head_size(), cos, sin);
+            rope(k, cfg_.n_kv_heads, cfg_.head_size(), cos, sin);
+            const auto at = static_cast<std::ptrdiff_t>((pos + i) * KV);
+            std::copy(k, k + KV, key_cache_[l].data.begin() + at);
+            std::copy(v, v + KV, value_cache_[l].data.begin() + at);
+        }
 
-        attention(l, pos + 1, q, att_.data.data());
-        add_into(x_, matmul_parallel(att_, lw.wo));
+        attention(l, pos, qkv, att_);
+        add_into(x_, project(att_, lw.wo, ql.wo));
 
         // SwiGLU: w2(silu(w1 x) * w3 x).
-        const Tensor gu = matmul_parallel(rmsnorm(x_, lw.rms_ffn), lw.w13);
-        for (std::size_t i = 0; i < H; ++i) {
-            const float g = gu.data[i];
-            hb_.data[i] = g / (1.0f + std::exp(-g)) * gu.data[H + i];
+        const Tensor gu = project(rmsnorm(x_, lw.rms_ffn), lw.w13, ql.w13);
+        for (std::size_t i = 0; i < n; ++i) {
+            const float* g = gu.data.data() + i * 2 * H;
+            float* hb = hb_.data.data() + i * H;
+            for (std::size_t j = 0; j < H; ++j) hb[j] = g[j] / (1.0f + std::exp(-g[j])) * g[H + j];
         }
-        add_into(x_, matmul_parallel(hb_, lw.w2));
+        add_into(x_, project(hb_, lw.w2, ql.w2));
     }
-    filled_ = pos + 1;
+    filled_ = pos + n;
 
-    const Tensor logits = matmul_parallel(rmsnorm(x_, w_.rms_final), w_.wcls);
+    // Only the last row's logits are returned.
+    Tensor last(1, D);
+    std::copy(x_.data.end() - static_cast<std::ptrdiff_t>(D), x_.data.end(), last.data.begin());
+    const Tensor logits = project(rmsnorm(last, w_.rms_final), w_.wcls, qcls_);
     std::copy(logits.data.begin(), logits.data.end(), logits_.begin());
     return logits_;
 }

@@ -5,7 +5,8 @@
 // With no sizes given, a second table times decode-shaped products: a few
 // rows of activations against a 4096 x 4096 weight matrix, as when generating
 // one token at a time. Those are bound by streaming B from memory, so the
-// table also reports B's bandwidth.
+// table also reports B's bandwidth, for fp32 B and for int8 B (a quarter of
+// the bytes; GFLOPS counts the same multiply-adds).
 //
 // Each measurement is the median of several timed runs after one warm-up
 // run, so a single preempted or cold-cache run doesn't move the number.
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "matmul.h"
+#include "quant.h"
 
 namespace {
 
@@ -103,16 +105,20 @@ int main(int argc, char** argv) {
     constexpr std::size_t kDim = 4096;
     std::printf("\nm x %zu times %zu x %zu (parallel); cells are ms / GFLOPS / GB/s of B\n\n",
                 kDim, kDim, kDim);
-    std::printf("%6s | %9s %8s %8s\n", "m", "ms", "GFLOPS", "GB/s");
-    std::printf("-------+---------------------------\n");
+    std::printf("%6s | %26s | %26s\n", "m", "fp32 B", "int8 B");
+    std::printf("-------+----------------------------+---------------------------\n");
     const Tensor W = random_tensor(kDim, kDim, rng);
-    const double w_bytes = static_cast<double>(W.data.size() * sizeof(float));
+    const QTensor Wq = quantize_q8(W);
+    const double f32_bytes = static_cast<double>(W.data.size() * sizeof(float));
+    const double q8_bytes = static_cast<double>(Wq.data.size() + Wq.scale.size() * sizeof(float));
     for (std::size_t m : {std::size_t{1}, std::size_t{4}, std::size_t{16}, std::size_t{64}}) {
         const Tensor X = random_tensor(m, kDim, rng);
-        const double secs = median_seconds([&] { return matmul_parallel(X, W); }, 15);
         const double flops = 2.0 * static_cast<double>(m) * kDim * kDim;
-        std::printf("%6zu | %9.2f %8.1f %8.1f\n", m, secs * 1e3, flops / secs / 1e9,
-                    w_bytes / secs / 1e9);
+        const double f32 = median_seconds([&] { return matmul_parallel(X, W); }, 15);
+        const double q8 = median_seconds([&] { return matmul_parallel(X, Wq); }, 15);
+        std::printf("%6zu | %8.2f %8.1f %8.1f | %8.2f %8.1f %8.1f\n", m, f32 * 1e3,
+                    flops / f32 / 1e9, f32_bytes / f32 / 1e9, q8 * 1e3, flops / q8 / 1e9,
+                    q8_bytes / q8 / 1e9);
         std::fflush(stdout);
     }
 }

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "model.h"
+#include "quant.h"
 
 namespace {
 
@@ -218,6 +219,83 @@ void test_matches_reference(int heads, int kv_heads, bool shared) {
     }
 }
 
+// Prefill in chunks of 1, 1 and 5 rows (the streaming path, then the packed
+// GEMM above m = 4) matches the reference at each chunk's last position, and
+// a decode step after it sees the cache prefill wrote.
+void test_prefill(int heads, int kv_heads, bool shared) {
+    const RawModel m = make_model(heads, kv_heads, shared, std::uint32_t(heads * 10 + kv_heads));
+    const std::string path = temp_path("engine_test_prefill.bin");
+    write_checkpoint(m, path);
+    Transformer model(load_checkpoint(path));
+    std::filesystem::remove(path);
+
+    std::vector<int> tokens;
+    for (int pos = 0; pos < m.seq_len; ++pos) tokens.push_back((pos * 5 + 2) % m.vocab);
+    std::size_t pos = 0;
+    for (std::size_t chunk : {1, 1, 5}) {
+        const std::vector<int> part(tokens.begin() + long(pos), tokens.begin() + long(pos + chunk));
+        const auto& logits = model.prefill(part, pos);
+        pos += chunk;
+        const std::vector<int> prefix(tokens.begin(), tokens.begin() + long(pos));
+        CHECK(max_abs_diff(logits, reference_logits(m, prefix)) <= kTol);
+    }
+    const auto& logits = model.forward(tokens[pos], pos);
+    const std::vector<int> prefix(tokens.begin(), tokens.begin() + long(pos + 1));
+    CHECK(max_abs_diff(logits, reference_logits(m, prefix)) <= kTol);
+
+    // Whole context in one pass, rewinding over what is cached.
+    CHECK(max_abs_diff(model.prefill(tokens, 0), reference_logits(m, tokens)) <= kTol);
+}
+
+// W (out x in, as in the file) after an int8 round trip with one scale per
+// output channel, the same scheme the Transformer applies to its (in x out)
+// copy per column.
+std::vector<float> q8_round_trip(const std::vector<float>& W, std::size_t out, std::size_t in) {
+    Tensor t(in, out);
+    for (std::size_t o = 0; o < out; ++o)
+        for (std::size_t i = 0; i < in; ++i) t.at(i, o) = W[o * in + i];
+    const Tensor d = dequantize(quantize_q8(t));
+    std::vector<float> back(W.size());
+    for (std::size_t o = 0; o < out; ++o)
+        for (std::size_t i = 0; i < in; ++i) back[o * in + i] = d.at(i, o);
+    return back;
+}
+
+// A q8 model computes exactly the fp32 model whose projections and
+// classifier were replaced by their int8 round trips; the embedding lookup
+// stays fp32, so a tied classifier becomes a separate, rounded one. Covers
+// decode and prefill on both matmul paths.
+void test_q8(int heads, int kv_heads, bool shared) {
+    const RawModel m = make_model(heads, kv_heads, shared, std::uint32_t(heads * 10 + kv_heads));
+    const std::string path = temp_path("engine_test_q8.bin");
+    write_checkpoint(m, path);
+    Transformer model(load_checkpoint(path), WeightType::q8);
+    std::filesystem::remove(path);
+
+    const auto D = std::size_t(m.dim), H = std::size_t(m.hidden), KV = std::size_t(m.kv_dim());
+    RawModel ref = m;
+    for (std::size_t l = 0; l < std::size_t(m.layers); ++l) {
+        ref.wq[l] = q8_round_trip(m.wq[l], D, D);
+        ref.wk[l] = q8_round_trip(m.wk[l], KV, D);
+        ref.wv[l] = q8_round_trip(m.wv[l], KV, D);
+        ref.wo[l] = q8_round_trip(m.wo[l], D, D);
+        ref.w1[l] = q8_round_trip(m.w1[l], H, D);
+        ref.w2[l] = q8_round_trip(m.w2[l], D, H);
+        ref.w3[l] = q8_round_trip(m.w3[l], H, D);
+    }
+    ref.wcls = q8_round_trip(shared ? m.emb : m.wcls, std::size_t(m.vocab), D);
+    ref.shared = false;
+
+    std::vector<int> tokens;
+    for (int pos = 0; pos < m.seq_len; ++pos) tokens.push_back((pos * 3 + 1) % m.vocab);
+    for (std::size_t pos = 0; pos < 3; ++pos) {
+        const std::vector<int> prefix(tokens.begin(), tokens.begin() + long(pos + 1));
+        CHECK(max_abs_diff(model.forward(tokens[pos], pos), reference_logits(ref, prefix)) <=
+              kTol);
+    }
+    CHECK(max_abs_diff(model.prefill(tokens, 0), reference_logits(ref, tokens)) <= kTol);
+}
+
 // Rewinding overwrites the cache from that position on.
 void test_rewind() {
     const RawModel m = make_model(4, 2, true, 7);
@@ -266,6 +344,10 @@ void test_bad_inputs() {
     CHECK(!error_of<std::out_of_range>([&] { model.forward(0, 1); }).empty());  // skips pos 0
     for (int pos = 0; pos < m.seq_len; ++pos) model.forward(0, std::size_t(pos));
     CHECK(!error_of<std::out_of_range>([&] { model.forward(0, std::size_t(m.seq_len)); }).empty());
+    CHECK(!error_of<std::invalid_argument>([&] { model.prefill({}, 0); }).empty());
+    CHECK(!error_of<std::out_of_range>([&] { model.prefill({0, 0}, std::size_t(m.seq_len) - 1); })
+               .empty());
+    CHECK(!error_of<std::out_of_range>([&] { model.prefill({0, m.vocab}, 0); }).empty());
 }
 
 } // namespace
@@ -274,6 +356,11 @@ int main() {
     test_matches_reference(4, 4, true);   // multi-head, tied classifier
     test_matches_reference(4, 2, false);  // grouped-query, separate classifier
     test_matches_reference(4, 1, true);   // multi-query
+    test_prefill(4, 4, true);
+    test_prefill(4, 2, false);
+    test_prefill(4, 1, true);
+    test_q8(4, 2, false);
+    test_q8(4, 1, true);
     test_rewind();
     test_bad_inputs();
 

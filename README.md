@@ -16,9 +16,9 @@ of the transformer is written by hand.
 - [x] Full transformer forward pass on CPU
 - [x] Text generation with sampling
 - [x] KV cache
-- [ ] Batched prompt prefill
+- [x] Batched prompt prefill
+- [x] int8 weight quantization
 - [ ] CUDA kernels: matmul, softmax, RMSNorm, attention
-- [ ] int8 quantization
 - [ ] Benchmarks vs llama.cpp
 
 ## Running a model
@@ -33,8 +33,8 @@ build/generate models/stories15M.bin -t 0.8 -p 0.9 -i "One day, Tom found a"
 ```
 
 `-t 0` is greedy; with no prompt it tells the familiar "Once upon a time,
-there was a little girl named Lily..." story. Text goes to stdout, load time
-and decode speed to stderr.
+there was a little girl named Lily..." story. `-w q8` stores the weights as
+int8. Text goes to stdout, load time, prefill and decode speed to stderr.
 
 ## Benchmarks
 Square fp32 matmul, median of several runs after a warm-up
@@ -48,14 +48,20 @@ Square fp32 matmul, median of several runs after a warm-up
 
 Decode-shaped products, one to a few token rows times a 4096 x 4096 weight
 matrix, are bound by streaming the weights from memory rather than by FLOPs.
-A parallel streaming read on this machine peaks at 51.7 GB/s.
+A parallel streaming read on this machine peaks at 51.7 GB/s. With int8
+weights B is 16.8 MB, a quarter of the bytes (same run for both columns):
 
-| m (rows) | Time    | GFLOPS | Weight bandwidth |
-|----------|---------|--------|------------------|
-| 1        | 1.48 ms | 22.7   | 45.5 GB/s        |
-| 4        | 1.87 ms | 71.9   | 35.9 GB/s        |
-| 16       | 3.08 ms | 174.3  | 21.8 GB/s        |
-| 64       | 6.06 ms | 354.2  | 11.1 GB/s        |
+| m (rows) | fp32 B  | GB/s | int8 B  | GB/s | Speed-up |
+|----------|---------|------|---------|------|----------|
+| 1        | 1.99 ms | 33.8 | 0.22 ms | 75.9 | 9.0x     |
+| 4        | 2.13 ms | 31.5 | 0.87 ms | 19.4 | 2.4x     |
+| 16       | 3.78 ms | 17.7 | 1.82 ms | 9.2  | 2.1x     |
+| 64       | 6.30 ms | 10.7 | 5.34 ms | 3.1  | 1.2x     |
+
+int8 at m = 1 beats the DRAM peak because most of B stays in the 16 MB L3
+between runs; m >= 4 is bound by widening int8 to fp32 (one core does
+~2 elements per cycle), not by bytes. In about one call in ten a straggling
+worker adds 0.5-1 ms; medians are stable, p90s aren't.
 
 Token generation with stories15M (dim 288, 6 layers, 32k vocab), greedy,
 256 positions:
@@ -64,6 +70,32 @@ Token generation with stories15M (dim 288, 6 layers, 32k vocab), greedy,
 |--------------------------|------------|------------|
 | Condvar wake per job     | 5.4-5.9    | 168-186    |
 | Spin, then sleep         | 2.04-2.12  | 472-491    |
+
+Weights and prompt handling, five interleaved runs of each build, medians
+(this session ran ~30% slower than the table above, so compare rows here
+with each other only). The prompt is 158 tokens:
+
+| Build                            | Decode, ms / token | Prompt, 158 tok    |
+|----------------------------------|--------------------|--------------------|
+| fp32, prompt one token at a time | 2.75               | 433 ms             |
+| fp32, batched prefill            | 2.74               | 39 ms (4.1k tok/s) |
+| int8 (`-w q8`), batched prefill  | 1.12               | 35 ms              |
+
+Prefill replaces 158 m = 1 passes, each streaming all 61 MB of weights,
+with one pass of m = 158 GEMMs, and skips the classifier (37 of those 61 MB)
+for every row but the last. Greedy output is byte-identical to the
+token-at-a-time path.
+
+int8 accuracy, teacher-forced against fp32 on the same tokens:
+
+| Text                    | Tokens | Perplexity fp32 / int8 | Mean KL (nats) | Top-1 agree |
+|-------------------------|--------|------------------------|----------------|-------------|
+| Hand-written story      | 157    | 7.388 / 7.400          | 9.3e-4         | 99.4%       |
+| fp32 greedy output      | 221    | 1.457 / 1.458          | 6.4e-4         | 99.5%       |
+| fp32 sampled, t = 1     | 169    | 2.249 / 2.244          | 6.7e-4         | 98.8%       |
+
+Greedy text from the two matches for the first ~200 tokens, then they take
+different, equally plausible endings.
 
 One token is 25 matmuls, most of them 6-40 us of work. A condition-variable
 wake-up costs ~100 us on Windows, so the old pool spent most of each token
@@ -91,22 +123,22 @@ changes by running old and new builds back to back, not against these tables.
    wake-up rather than a thread spawn, and there's no locking around C.
    Idle workers spin for a few hundred microseconds before sleeping, and
    joining a job takes no lock, so back-to-back calls start in about a
-   microsecond. Rows
-   are split first; when m is too small to occupy every thread (m = 1 per
-   generated token), the rest go to column slabs, which pack only their own
-   slice of B.
-6. **Streaming path for m <= 4.** With so few rows, packing B only adds
+   microsecond. Rows are split first; when m is too small to occupy every
+   thread (m = 1 per generated token), the rest go to column slabs, which
+   pack only their own slice of B.
+5. **Streaming path for m <= 4.** With so few rows, packing B only adds
    memory traffic. Each task instead takes a contiguous range of B's rows,
    reads them strictly in order into a private partial C that stays in
    cache, and the partials are summed at the end (split-K). This is the only
    split that reads a row-major B sequentially; splitting by columns gave
    ~20 GB/s because each thread jumps 16 KB between short reads.
-5. **No allocation in steady state.** Packing buffers are thread-local,
+6. **No allocation in steady state.** Packing buffers are thread-local,
    64-byte aligned and grow-only. Packing overwrites everything the kernel
    reads, so they are never zeroed.
 
 ### How the forward pass works
-`src/model.cpp` loads a llama2.c checkpoint and runs one token at a time:
+`src/model.cpp` loads a llama2.c checkpoint and runs the prompt in one batch,
+then one token at a time:
 
 - **Weights stored transposed.** The file holds projections as (out x in);
   they're stored (in x out) at load so `x * W` is a plain row-times-matrix
@@ -117,18 +149,38 @@ changes by running old and new builds back to back, not against these tables.
 - **KV cache.** Each position's rotated keys and values are kept per layer,
   so a new token runs attention against the cache instead of recomputing the
   prefix. Grouped-query attention maps each query head to its kv head.
+- **Batched prefill.** `prefill()` runs n tokens as n-row activations
+  through the same code as `forward()`, which is just n = 1: projections
+  become m = n GEMMs, each row's keys and values go into the cache before
+  attention, and row i attends to positions up to pos + i. Attention is one
+  pool task per (row, head).
+- **int8 weights.** `WeightType::q8` quantizes each projection and the
+  classifier at load, symmetric with one scale per output channel (a column
+  of the stored (in x out) matrix), then frees the fp32 copy. The
+  streaming path widens int8 to fp32 in its inner loop and applies the
+  scales once, after the split-K sum; the packed path dequantizes while it
+  packs B, so the micro-kernel is unchanged. Quantizing adds ~100 ms to
+  load.
 - **Tested against a reference.** `tests/test_model.cpp` writes small random
   checkpoints (multi-head, grouped-query, multi-query; tied and separate
   classifier) and checks every position's logits against a from-scratch,
-  double-precision implementation that reads the file's own layout.
+  double-precision implementation that reads the file's own layout, for
+  token-by-token decode, chunked prefill and int8 (against the reference
+  run on the int8-rounded weights).
 
 Known limits and next steps:
-- Prompts go through the model one token at a time. Running the whole
-  prompt as one m = n_prompt pass would turn it into proper GEMMs.
-- Decode is memory-bound: fp32 weights put the floor at ~1.2 ms/token here.
-  Smaller weight types (bf16, int8) cut it directly. Splitting the k = 288
-  products into more than 5 split-K tasks was slower: the partial sums cost
-  more than the extra bandwidth bought.
+- fp32 decode is memory-bound: the weights put the floor at ~1.2 ms/token
+  here. Splitting the k = 288 products into more than 5 split-K tasks was
+  slower: the partial sums cost more than the extra bandwidth bought.
+- int8 decode is now bound by compute in the int8-to-fp32 widening, not by
+  bytes. GCC widens in two steps (8->16->32 bit) with mixed vector widths;
+  an AVX-512 kernel that widens once, or int8 dot products against
+  quantized activations (VNNI), is the next step. Doing four rows of B per
+  pass over the accumulators sped fp32 up single-threaded (3.5 -> 2.2 ms)
+  but changed neither path with 16 threads, so it isn't in.
+- Prefill reaches ~50 GFLOPS: m = 158 against k = 288 is too thin to fill
+  16 threads with MC = 64 row blocks. Very long prompts would also want
+  their activations chunked.
 - A tied classifier is stored twice, as the embedding and transposed.
 - Each row slab packs all of B; sharing one packed copy would cut memory
   traffic for large m.

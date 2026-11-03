@@ -15,3 +15,8 @@ Tensor matmul_blocked(const Tensor& A, const Tensor& B);
 // Blocked kernel split across threads by rows of C. threads == 0 means
 // std::thread::hardware_concurrency(). Small problems use fewer threads.
 Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads = 0);
+
+// Same as above with int8 weights: C = A x dequantize(B). The int8 values are
+// widened to fp32 inside the kernels, so B is read from memory at a quarter
+// of the fp32 size.
+Tensor matmul_parallel(const Tensor& A, const QTensor& B, unsigned threads = 0);

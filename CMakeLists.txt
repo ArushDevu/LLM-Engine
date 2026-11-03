@@ -31,8 +31,8 @@ else()
 endif()
 
 add_library(engine_core
-  src/matmul.cpp src/model.cpp src/ops.cpp src/sampler.cpp src/thread_pool.cpp
-  src/tokenizer.cpp)
+  src/matmul.cpp src/model.cpp src/ops.cpp src/quant.cpp src/sampler.cpp
+  src/thread_pool.cpp src/tokenizer.cpp)
 target_include_directories(engine_core PUBLIC src)
 target_link_libraries(engine_core PUBLIC Threads::Threads PRIVATE engine_warnings)
 if(ENGINE_NATIVE AND NOT MSVC)
@@ -61,6 +61,10 @@ add_test(NAME thread_pool COMMAND test_thread_pool)
 add_executable(test_model tests/test_model.cpp)
 target_link_libraries(test_model PRIVATE engine_core engine_warnings)
 add_test(NAME model COMMAND test_model)
+
+add_executable(test_quant tests/test_quant.cpp)
+target_link_libraries(test_quant PRIVATE engine_core engine_warnings)
+add_test(NAME quant COMMAND test_quant)
 
 add_executable(test_tokenizer tests/test_tokenizer.cpp)
 target_link_libraries(test_tokenizer PRIVATE engine_core engine_warnings)

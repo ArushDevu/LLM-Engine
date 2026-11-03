@@ -7,6 +7,7 @@
 //     -t <float>  temperature, 0 = greedy (default 1.0)
 //     -p <float>  top-p (default 0.9)
 //     -s <int>    RNG seed (default: time)
+//     -w <type>   weight storage: f32 or q8 (int8, default f32)
 //
 // Generation stops at seq_len or when the model emits BOS, which separates
 // stories in the training data. Timing goes to stderr so stdout is only text.
@@ -31,7 +32,7 @@ using Clock = std::chrono::steady_clock;
 [[noreturn]] void usage() {
     std::fprintf(stderr,
                  "usage: generate <checkpoint.bin> [-z tokenizer] [-i prompt] [-n steps]\n"
-                 "                [-t temperature] [-p top_p] [-s seed]\n");
+                 "                [-t temperature] [-p top_p] [-s seed] [-w f32|q8]\n");
     std::exit(2);
 }
 
@@ -58,6 +59,7 @@ int main(int argc, char** argv) try {
     std::size_t steps = 0;
     float temperature = 1.0f, top_p = 0.9f;
     auto seed = static_cast<std::uint64_t>(std::time(nullptr));
+    WeightType weights = WeightType::f32;
 
     for (int i = 2; i < argc; i += 2) {
         const std::string flag = argv[i];
@@ -70,6 +72,13 @@ int main(int argc, char** argv) try {
             case 't': temperature = std::strtof(val, nullptr); break;
             case 'p': top_p = std::strtof(val, nullptr); break;
             case 's': seed = std::strtoull(val, nullptr, 10); break;
+            case 'w':
+                if (std::string(val) == "q8") {
+                    weights = WeightType::q8;
+                } else if (std::string(val) != "f32") {
+                    usage();
+                }
+                break;
             default: usage();
         }
     }
@@ -77,7 +86,7 @@ int main(int argc, char** argv) try {
         tok_path = (std::filesystem::path(ckpt_path).parent_path() / "tokenizer.bin").string();
 
     const auto t_load = Clock::now();
-    Transformer model(load_checkpoint(ckpt_path));
+    Transformer model(load_checkpoint(ckpt_path), weights);
     const Config& cfg = model.config();
     const Tokenizer tokenizer(tok_path, cfg.vocab_size);
     Sampler sampler(temperature, top_p, seed);
@@ -90,36 +99,38 @@ int main(int argc, char** argv) try {
         return 1;
     }
 
-    // Prompt tokens are fed one at a time through the same path as generated
-    // ones; their logits are discarded except the last.
+    // The whole prompt goes through in one prefill pass; generated tokens are
+    // then fed one at a time.
     const auto t_start = Clock::now();
+    const std::vector<float>* logits = &model.prefill(prompt_tokens, 0);
+    const auto t_prefill = Clock::now();
+    for (std::size_t i = 0; i + 1 < prompt_tokens.size(); ++i)
+        print_piece(tokenizer.decode(prompt_tokens[i], prompt_tokens[i + 1]));
+
     Clock::time_point t_first{};
-    int token = prompt_tokens[0];
-    std::size_t pos = 0, generated = 0;
-    while (pos < steps) {
-        const std::vector<float>& logits = model.forward(token, pos);
-        int next;
-        if (pos + 1 < prompt_tokens.size()) {
-            next = prompt_tokens[pos + 1];
-        } else {
-            std::vector<float> probs = logits;
-            next = sampler.sample(probs);
-            if (generated++ == 0) t_first = Clock::now();
-        }
-        ++pos;
+    int token = prompt_tokens.back();
+    std::size_t pos = prompt_tokens.size(), generated = 0;
+    for (;;) {
+        std::vector<float> probs = *logits;
+        const int next = sampler.sample(probs);
+        if (generated++ == 0) t_first = Clock::now();
         if (next == Tokenizer::kBos) break;
         print_piece(tokenizer.decode(token, next));
         std::fflush(stdout);
         token = next;
+        if (pos >= steps) break;
+        logits = &model.forward(token, pos++);
     }
     const auto t_end = Clock::now();
     std::printf("\n");
 
     // The first sampled token closes the prompt; decode speed is measured
     // over the tokens after it.
-    std::fprintf(stderr, "load %.0f ms | prompt %zu tok, first token %.1f ms",
-                 ms_between(t_load, t_start), prompt_tokens.size(),
-                 ms_between(t_start, t_first));
+    const double prefill_ms = ms_between(t_start, t_prefill);
+    std::fprintf(stderr, "load %.0f ms | prompt %zu tok, prefill %.1f ms (%.0f tok/s), "
+                 "first token %.1f ms",
+                 ms_between(t_load, t_start), prompt_tokens.size(), prefill_ms,
+                 1e3 * double(prompt_tokens.size()) / prefill_ms, ms_between(t_start, t_first));
     if (generated > 1) {
         const double ms = ms_between(t_first, t_end) / double(generated - 1);
         std::fprintf(stderr, " | decode %zu tok, %.3f ms/tok, %.0f tok/s", generated - 1, ms,

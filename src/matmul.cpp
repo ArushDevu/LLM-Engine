@@ -5,6 +5,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "thread_pool.h"
 
@@ -50,27 +51,38 @@ private:
     std::size_t cap_ = 0;
 };
 
-std::string shape_str(const Tensor& t) {
+template <class T>
+std::string shape_str(const T& t) {
     return std::to_string(t.rows) + "x" + std::to_string(t.cols);
 }
 
-void check_shapes(const Tensor& A, const Tensor& B) {
+template <class BT>
+void check_shapes(const Tensor& A, const BT& B) {
     if (A.cols == B.rows) return;
     throw std::invalid_argument("matmul: inner dimensions differ (A is " + shape_str(A) +
                                 ", B is " + shape_str(B) + ")");
 }
 
+// B is fp32, or int8 with one scale per column (null for fp32); the
+// kernels below are templates over the element type.
+
 // Pack a kc x nc block of B into NR-wide column panels. Panel j holds
 // B[p][j*NR .. j*NR + NR) for p = 0..kc-1 back to back, so the micro-kernel
-// reads it with unit stride. Columns past nc are zero-filled.
-void pack_b(const float* B, std::size_t ldb, std::size_t kc, std::size_t nc,
-            float* out) {
+// reads it with unit stride. Columns past nc are zero-filled. int8 B is
+// dequantized here, so the micro-kernel only ever sees fp32.
+template <class BT>
+void pack_b(const BT* B, std::size_t ldb, std::size_t kc, std::size_t nc,
+            const float* scale, float* out) {
     for (std::size_t j0 = 0; j0 < nc; j0 += NR) {
         const std::size_t nr = std::min(NR, nc - j0);
         for (std::size_t p = 0; p < kc; ++p) {
-            const float* src = B + p * ldb + j0;
+            const BT* src = B + p * ldb + j0;
             std::size_t c = 0;
-            for (; c < nr; ++c) out[c] = src[c];
+            if constexpr (std::is_same_v<BT, float>) {
+                for (; c < nr; ++c) out[c] = src[c];
+            } else {
+                for (; c < nr; ++c) out[c] = static_cast<float>(src[c]) * scale[j0 + c];
+            }
             for (; c < NR; ++c) out[c] = 0.0f;
             out += NR;
         }
@@ -114,10 +126,12 @@ void micro_kernel(std::size_t kc, const float* __restrict Ap,
 
 // C += A * B on raw row-major buffers with leading dimensions. C must be
 // initialized by the caller. Packing buffers are per thread, so disjoint row
-// ranges of C can be computed concurrently.
+// ranges of C can be computed concurrently. For int8 B, scale points at the
+// scale of B's first column.
+template <class BT>
 void gemm(std::size_t m, std::size_t n, std::size_t k,
           const float* A, std::size_t lda,
-          const float* B, std::size_t ldb,
+          const BT* B, std::size_t ldb, const float* scale,
           float* C, std::size_t ldc) {
     // Thread-local so pool workers keep their buffers warm across calls.
     thread_local Scratch a_buf, b_buf;
@@ -129,7 +143,7 @@ void gemm(std::size_t m, std::size_t n, std::size_t k,
         const std::size_t nc = std::min(NC, n - jc);
         for (std::size_t pc = 0; pc < k; pc += KC) {
             const std::size_t kc = std::min(KC, k - pc);
-            pack_b(B + pc * ldb + jc, ldb, kc, nc, Bp);
+            pack_b(B + pc * ldb + jc, ldb, kc, nc, scale ? scale + jc : nullptr, Bp);
 
             for (std::size_t ic = 0; ic < m; ic += MC) {
                 const std::size_t mc = std::min(MC, m - ic);
@@ -167,17 +181,20 @@ constexpr std::size_t kStreamMaxRows = 4;
 constexpr std::size_t kStreamMinK = 64;
 
 // acc[0:m, 0:n] = A[0:m, 0:k] * B[0:k, 0:n]; acc is dense with stride n.
+// int8 B is summed unscaled; the caller applies the column scales once, to
+// the reduced result.
+template <class BT>
 void gemm_stream(std::size_t m, std::size_t n, std::size_t k,
                  const float* __restrict A, std::size_t lda,
-                 const float* __restrict B, std::size_t ldb,
+                 const BT* __restrict B, std::size_t ldb,
                  float* __restrict acc) {
     std::fill(acc, acc + m * n, 0.0f);
     for (std::size_t p = 0; p < k; ++p) {
-        const float* b = B + p * ldb;
+        const BT* b = B + p * ldb;
         for (std::size_t r = 0; r < m; ++r) {
             const float a = A[r * lda + p];
             float* out = acc + r * n;
-            for (std::size_t c = 0; c < n; ++c) out[c] += a * b[c];
+            for (std::size_t c = 0; c < n; ++c) out[c] += a * static_cast<float>(b[c]);
         }
     }
 }
@@ -203,9 +220,11 @@ Tensor matmul_blocked(const Tensor& A, const Tensor& B) {
     check_shapes(A, B);
     Tensor C(A.rows, B.cols);
     gemm(A.rows, B.cols, A.cols, A.data.data(), A.cols,
-         B.data.data(), B.cols, C.data.data(), C.cols);
+         B.data.data(), B.cols, nullptr, C.data.data(), C.cols);
     return C;
 }
+
+namespace {
 
 // C is cut into a grid of tiles: MR-aligned slabs of rows by NR-aligned slabs
 // of columns. Each task owns one tile and its own packing buffers, so there is
@@ -217,9 +236,11 @@ Tensor matmul_blocked(const Tensor& A, const Tensor& B) {
 // generation -- the leftover threads go to column slabs. A column slab packs
 // only its own slice of B, so splitting by columns adds no packing work, while
 // splitting by rows makes every slab pack all of B again.
-Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
-    check_shapes(A, B);
-    const std::size_t m = A.rows, n = B.cols, k = A.cols;
+// B is k x n with leading dimension n; scale is null for fp32 B.
+template <class BT>
+Tensor parallel(const Tensor& A, const BT* B, const float* scale, std::size_t n,
+                unsigned threads) {
+    const std::size_t m = A.rows, k = A.cols;
     Tensor C(m, n);
     if (m == 0 || n == 0) return C;
 
@@ -242,7 +263,7 @@ Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
         auto run_span = [&](std::size_t t) {
             const std::size_t p0 = t * span;
             gemm_stream(m, n, std::min(span, k - p0), A.data.data() + p0, k,
-                        B.data.data() + p0 * n, n, partials + t * m * n);
+                        B + p0 * n, n, partials + t * m * n);
         };
         if (tasks == 1) {
             run_span(0);
@@ -253,6 +274,10 @@ Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
         for (std::size_t t = 0; t < tasks; ++t) {
             const float* part = partials + t * m * n;
             for (std::size_t i = 0; i < m * n; ++i) out[i] += part[i];
+        }
+        if (scale) {
+            for (std::size_t r = 0; r < m; ++r)
+                for (std::size_t c = 0; c < n; ++c) out[r * n + c] *= scale[c];
         }
         return C;
     }
@@ -269,7 +294,7 @@ Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
         const std::size_t col0 = (t % col_tiles) * col_slab;
         gemm(std::min(row_slab, m - row0), std::min(col_slab, n - col0), k,
              A.data.data() + row0 * k, k,
-             B.data.data() + col0, n,
+             B + col0, n, scale ? scale + col0 : nullptr,
              C.data.data() + row0 * n + col0, n);
     };
     if (row_tiles * col_tiles == 1) {
@@ -278,4 +303,16 @@ Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
         pool.run(row_tiles * col_tiles, run_tile);
     }
     return C;
+}
+
+} // namespace
+
+Tensor matmul_parallel(const Tensor& A, const Tensor& B, unsigned threads) {
+    check_shapes(A, B);
+    return parallel(A, B.data.data(), nullptr, B.cols, threads);
+}
+
+Tensor matmul_parallel(const Tensor& A, const QTensor& B, unsigned threads) {
+    check_shapes(A, B);
+    return parallel(A, B.data.data(), B.scale.data(), B.cols, threads);
 }

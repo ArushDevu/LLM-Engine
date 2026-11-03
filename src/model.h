@@ -53,12 +53,18 @@ struct Checkpoint {
 // is inconsistent, or the file size doesn't match the header.
 Checkpoint load_checkpoint(const std::string& path);
 
-// Runs the model one token at a time. Keys and values of every position fed
-// so far are cached, so each new token attends to the past without
+// How the Transformer stores projection weights. q8 quantizes every
+// projection and the classifier to int8 with a scale per output channel
+// (quant.h), a quarter of the bytes to stream per token; the embedding stays
+// fp32, since a token reads only its own row.
+enum class WeightType { f32, q8 };
+
+// Runs the model over positions fed in order. Keys and values of every
+// position fed so far are cached, so new tokens attend to the past without
 // recomputing it.
 class Transformer {
 public:
-    explicit Transformer(Checkpoint ckpt);
+    explicit Transformer(Checkpoint ckpt, WeightType type = WeightType::f32);
 
     // Feeds token at position pos and returns logits for the next token. pos
     // may be at most the number of positions already fed, so the caller can
@@ -67,23 +73,48 @@ public:
     // a token outside the vocabulary, pos >= seq_len, or a skipped position.
     const std::vector<float>& forward(int token, std::size_t pos);
 
+    // Feeds tokens at positions [pos, pos + tokens.size()) in one pass and
+    // returns logits for the token after the last; same result as calling
+    // forward() on each in turn. Every projection becomes an m = tokens.size()
+    // GEMM instead of m = 1 products that each stream all the weights, and the
+    // classifier runs only for the last row. Same position rules and
+    // reference lifetime as forward(); also throws std::invalid_argument for
+    // an empty tokens.
+    const std::vector<float>& prefill(const std::vector<int>& tokens, std::size_t pos);
+
     const Config& config() const { return cfg_; }
 
 private:
-    // Causal attention of the current query against cached positions
-    // [0, n) of layer l; writes one head_size slice per query head to out.
-    void attention(std::size_t l, std::size_t n, const float* q, float* out);
+    // Runs tokens[0:n] at positions [pos, pos + n).
+    const std::vector<float>& run(const int* tokens, std::size_t n, std::size_t pos);
+
+    // x * w, or x * the int8 copy of w when quantized.
+    Tensor project(const Tensor& x, const Tensor& w, const QTensor& wq) const;
+
+    // Causal attention of layer l for rows fed at positions [pos, pos +
+    // qkv.rows): row i's queries (the q columns of qkv) attend to cached
+    // positions [0, pos + i]. Writes one head_size slice per query head to
+    // the matching row of out.
+    void attention(std::size_t l, std::size_t pos, const Tensor& qkv, Tensor& out);
 
     Config cfg_;
-    Weights w_;
+    Weights w_;  // projections and classifier are emptied when quantized
+
+    // int8 copies, populated only for WeightType::q8.
+    struct QuantLayer {
+        QTensor wqkv, wo, w13, w2;
+    };
+    bool quantized_ = false;
+    std::vector<QuantLayer> qlayers_;
+    QTensor qcls_;
     std::vector<Tensor> key_cache_, value_cache_;  // per layer: seq_len x kv_dim
     std::vector<float> rope_cos_, rope_sin_;       // seq_len x head_size / 2
     std::size_t filled_ = 0;                       // positions in the cache
 
-    // Per-call scratch, sized once.
-    Tensor x_;      // 1 x dim residual stream
-    Tensor att_;    // 1 x dim attention output, heads side by side
-    Tensor hb_;     // 1 x hidden_dim gated feed-forward activation
-    std::vector<float> scores_;  // seq_len
+    // Per-call scratch, one row per token fed; reallocated only when the
+    // number of rows changes.
+    Tensor x_;      // n x dim residual stream
+    Tensor att_;    // n x dim attention output, heads side by side
+    Tensor hb_;     // n x hidden_dim gated feed-forward activation
     std::vector<float> logits_;  // vocab_size
 };
