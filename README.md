@@ -18,7 +18,8 @@ of the transformer is written by hand.
 - [x] KV cache
 - [x] Batched prompt prefill
 - [x] int8 weight quantization
-- [ ] CUDA kernels: matmul, softmax, RMSNorm, attention
+- [x] CUDA matmul kernels
+- [ ] CUDA forward pass: weights on the GPU, softmax, RMSNorm, attention
 - [ ] Benchmarks vs llama.cpp
 
 ## Running a model
@@ -105,6 +106,56 @@ alone runs at ~1.9 ms.
 
 Laptop numbers drift by 10-20% with temperature and power state, so compare
 changes by running old and new builds back to back, not against these tables.
+
+### GPU matmul
+RTX 4050 Laptop (20 SMs, sm_89, 24 MB L2), CUDA 13.4, MSVC host compiler
+(`bench_cuda`). Times run from launch to `cudaDeviceSynchronize()`, so they
+include the ~5-10 us launch cost. A device-to-device copy moves 168 GB/s
+(read + write), the bandwidth ceiling; cuBLAS SGEMM is the compute
+yardstick and isn't used by the engine.
+
+| N    | Naive     | Tiled          | cuBLAS    | CPU, 16 threads |
+|------|-----------|----------------|-----------|-----------------|
+| 1024 | 0.80 TFLOPS | 3.5 TFLOPS (53%) | 6.6 TFLOPS | 0.23 TFLOPS   |
+| 2048 | 0.80 TFLOPS | 4.3 TFLOPS (56%) | 7.7 TFLOPS | 0.31 TFLOPS   |
+| 4096 | 0.74 TFLOPS | 4.0 TFLOPS (60%) | 6.7 TFLOPS | -             |
+
+Decode shapes, m x 4096 times a 4096 x 4096 B already on the GPU:
+
+| m  | Engine           | cuBLAS   | Engine + copy A in, C out | CPU fp32 |
+|----|------------------|----------|---------------------------|----------|
+| 1  | 0.38 ms, 176 GB/s | 0.40 ms | 0.47 ms                   | 1.99 ms  |
+| 4  | 0.38 ms, 175 GB/s | 0.38 ms | 0.46 ms                   | 2.13 ms  |
+| 8  | 0.40 ms, 168 GB/s | 0.40 ms | 0.55 ms                   | -        |
+| 16 | 0.55 ms          | 0.40 ms  | 0.73 ms                   | 3.78 ms  |
+| 32 | 0.57 ms          | 0.41 ms  | 0.80 ms                   | -        |
+| 64 | 0.72 ms          | 0.42 ms  | 1.19 ms                   | 6.30 ms  |
+
+Up to m = 8 the engine reads B at the copy ceiling and matches cuBLAS.
+Each call's PCIe round trip for A and C costs ~0.1 ms, a quarter of the
+product, so a GPU forward pass must keep activations on the device between
+layers, not just weights.
+
+How the kernels work (`src/cuda_matmul.cu`):
+
+- **Tiled (m > 64).** A 256-thread block computes a 128 x 128 tile of C,
+  staging 128 x 8 of A (transposed, padded against bank conflicts) and
+  8 x 128 of B in shared memory per step; each thread accumulates 8 x 8
+  outputs in registers. A thread's rows and columns are strided across the
+  tile, so a warp reads consecutive shared-memory words and writes
+  consecutive columns of C.
+- **Split tiles (9 <= m <= 64).** The same kernel with 32- or 64-row tiles
+  and k split across `blockIdx.z` until there are ~8 blocks per SM. With
+  128-row tiles, m = 64 ran at 1.29 ms on 32 blocks; split, 0.72 ms.
+- **Skinny (m <= 8).** One thread per column of C streams its column of a k
+  slice, so each warp reads 128 contiguous bytes of a row of B per step; k is
+  split so ~64 warps per SM keep loads in flight. Partial sums go to a
+  scratch buffer and a second kernel adds them in a fixed order, so results
+  are deterministic (no atomics).
+
+Known limits: tiled is at 53-60% of cuBLAS (next: float4 loads,
+double-buffered shared memory, warp tiles); m = 16-64 trails cuBLAS by
+~1.4-1.7x; indexing is 32-bit, so each matrix must stay below 2^31 elements.
 
 ### How the CPU matmul works
 `src/matmul.cpp` follows the Goto/BLIS structure:
@@ -202,3 +253,20 @@ ctest --test-dir build        # correctness tests vs. the naive reference
 ```
 
 Pass `-DENGINE_NATIVE=OFF` to build a binary that runs on other machines.
+
+### CUDA build (Windows)
+nvcc only works with MSVC as the host compiler, and MSVC objects can't link
+into a MinGW build, so the GPU code builds in its own tree with `cl`. Needs
+Visual Studio 2022 Build Tools (C++ workload) and the CUDA Toolkit. From an
+"x64 Native Tools" prompt, with the toolkit's `bin\x64` on `PATH` for the
+cuBLAS DLL the benchmark uses:
+
+```bat
+cmake -S . -B build-cuda -G Ninja -DCMAKE_CXX_COMPILER=cl -DENGINE_CUDA=ON
+cmake --build build-cuda
+ctest --test-dir build-cuda   # CPU tests plus GPU kernels vs. the CPU reference
+build-cuda\bench_cuda
+```
+
+The kernels are compiled for the GPU in the machine (`native`); pass
+`-DCMAKE_CUDA_ARCHITECTURES=89` (or another) to target a different one.
