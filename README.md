@@ -19,7 +19,8 @@ of the transformer is written by hand.
 - [x] Batched prompt prefill
 - [x] int8 weight quantization
 - [x] CUDA matmul kernels
-- [ ] CUDA forward pass: weights on the GPU, softmax, RMSNorm, attention
+- [x] CUDA forward pass: weights, KV cache and activations on the GPU
+- [ ] Fused GPU kernels; int8 on the GPU
 - [ ] Benchmarks vs llama.cpp
 
 ## Running a model
@@ -35,7 +36,8 @@ build/generate models/stories15M.bin -t 0.8 -p 0.9 -i "One day, Tom found a"
 
 `-t 0` is greedy; with no prompt it tells the familiar "Once upon a time,
 there was a little girl named Lily..." story. `-w q8` stores the weights as
-int8. Text goes to stdout, load time, prefill and decode speed to stderr.
+int8; `-d gpu` runs on the GPU (a CUDA build, fp32 only). Text goes to
+stdout, load time, prefill and decode speed to stderr.
 
 ## Benchmarks
 Square fp32 matmul, median of several runs after a warm-up
@@ -157,6 +159,38 @@ Known limits: tiled is at 53-60% of cuBLAS (next: float4 loads,
 double-buffered shared memory, warp tiles); m = 16-64 trails cuBLAS by
 ~1.4-1.7x; indexing is 32-bit, so each matrix must stay below 2^31 elements.
 
+### GPU forward pass
+stories15M, five interleaved runs of each, medians; CPU numbers from the
+GCC build. Greedy and seeded sampled text are identical on GPU and CPU.
+
+| Device             | Decode, ms / token | Prefill, 158 tok | Load   |
+|--------------------|--------------------|------------------|--------|
+| CPU, fp32          | 2.02               | 24 ms            | 81 ms  |
+| CPU, int8 (`-w q8`) | 0.99              | 21 ms            | 192 ms |
+| GPU, fp32 (`-d gpu`) | 0.65             | 5.8 ms           | 270 ms |
+
+`CudaTransformer` (`src/cuda_model.cu`) keeps the weights, KV cache and
+activations in GPU memory; a call uploads its position and token ids and
+downloads only the logits. Each layer runs RMSNorm, the fused qkv matmul,
+RoPE plus the cache write, attention (one block per head and row, scores in
+shared memory), the output projection, a residual add, RMSNorm, gate/up,
+SwiGLU, the down projection and another add.
+
+That is ~100 kernels per token, and a launch costs 14-19 us of host time on
+this Windows driver, so launched one by one a token took 2.15 ms (one run),
+almost all of it launch overhead. The first decode step is instead captured
+into a CUDA graph and replayed with one launch per token: 0.65 ms. Kernels
+read the position and token from device memory, so one graph serves every
+position; it is captured again only if a buffer it points at moves
+(activation buffers are grow-only, and the matmul's split-K scratch reports
+a generation).
+
+The weights alone take ~0.36 ms to stream at 170 GB/s; the other ~0.3 ms is
+the graph's ~100 dependent kernels, each a few microseconds of work. Fusing
+RMSNorm, RoPE and the residual adds into neighbouring kernels is the next
+step, then int8 weights on the GPU. Attention keeps a row's scores in
+shared memory, which caps seq_len at ~12k.
+
 ### How the CPU matmul works
 `src/matmul.cpp` follows the Goto/BLIS structure:
 
@@ -264,8 +298,9 @@ cuBLAS DLL the benchmark uses:
 ```bat
 cmake -S . -B build-cuda -G Ninja -DCMAKE_CXX_COMPILER=cl -DENGINE_CUDA=ON
 cmake --build build-cuda
-ctest --test-dir build-cuda   # CPU tests plus GPU kernels vs. the CPU reference
+ctest --test-dir build-cuda   # CPU tests, GPU kernels and GPU model vs. the CPU
 build-cuda\bench_cuda
+build-cuda\generate models\stories15M.bin -t 0 -d gpu
 ```
 
 The kernels are compiled for the GPU in the machine (`native`); pass

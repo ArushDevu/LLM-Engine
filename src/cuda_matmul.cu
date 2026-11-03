@@ -1,6 +1,6 @@
 #include "cuda_matmul.h"
 
-#include <cuda_runtime.h>
+#include "cuda_check.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -8,11 +8,6 @@
 #include <utility>
 
 namespace {
-
-void check(cudaError_t err, const char* what) {
-    if (err != cudaSuccess)
-        throw std::runtime_error(std::string("cuda: ") + what + ": " + cudaGetErrorString(err));
-}
 
 std::string shape_str(const DeviceTensor& t) {
     return std::to_string(t.rows()) + "x" + std::to_string(t.cols());
@@ -144,14 +139,18 @@ __global__ void sum_slices(int mn, int slices, const float* __restrict__ partial
     C[i] = acc;
 }
 
-// Grow-only device scratch for split-K partial sums.
+// Grow-only device scratch for split-K partial sums. Each growth bumps the
+// generation, since it moves the buffer.
+std::size_t g_scratch_generation = 0;
+
 float* partial_buffer(std::size_t floats) {
     static float* buf = nullptr;
     static std::size_t cap = 0;
     if (floats > cap) {
-        if (buf) check(cudaFree(buf), "free partials");
-        check(cudaMalloc(&buf, floats * sizeof(float)), "alloc partials");
+        if (buf) cuda_check(cudaFree(buf), "free partials");
+        cuda_check(cudaMalloc(&buf, floats * sizeof(float)), "alloc partials");
         cap = floats;
+        ++g_scratch_generation;
     }
     return buf;
 }
@@ -166,8 +165,8 @@ void launch_skinny(int n, int k, int span, int slices, const float* A, const flo
 int sm_count() {
     static const int sms = [] {
         int device = 0, n = 0;
-        check(cudaGetDevice(&device), "get device");
-        check(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, device), "get SMs");
+        cuda_check(cudaGetDevice(&device), "get device");
+        cuda_check(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, device), "get SMs");
         return n;
     }();
     return sms;
@@ -222,7 +221,7 @@ void run_skinny(int m, int n, int k, const float* A, const float* B, float* C) {
 } // namespace
 
 DeviceTensor::DeviceTensor(std::size_t rows, std::size_t cols) : rows_(rows), cols_(cols) {
-    if (rows * cols) check(cudaMalloc(&data_, rows * cols * sizeof(float)), "alloc");
+    if (rows * cols) cuda_check(cudaMalloc(&data_, rows * cols * sizeof(float)), "alloc");
 }
 
 DeviceTensor::DeviceTensor(const Tensor& t) : DeviceTensor(t.rows, t.cols) { upload(t); }
@@ -243,17 +242,17 @@ DeviceTensor& DeviceTensor::operator=(DeviceTensor&& other) noexcept {
 void DeviceTensor::upload(const Tensor& t) {
     if (t.rows != rows_ || t.cols != cols_) *this = DeviceTensor(t.rows, t.cols);
     if (!t.data.empty())
-        check(cudaMemcpy(data_, t.data.data(), t.data.size() * sizeof(float),
-                         cudaMemcpyHostToDevice),
-              "upload");
+        cuda_check(cudaMemcpy(data_, t.data.data(), t.data.size() * sizeof(float),
+                              cudaMemcpyHostToDevice),
+                   "upload");
 }
 
 Tensor DeviceTensor::download() const {
     Tensor t(rows_, cols_);
     if (!t.data.empty())
-        check(cudaMemcpy(t.data.data(), data_, t.data.size() * sizeof(float),
-                         cudaMemcpyDeviceToHost),
-              "download");
+        cuda_check(cudaMemcpy(t.data.data(), data_, t.data.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost),
+                   "download");
     return t;
 }
 
@@ -262,44 +261,48 @@ void matmul_cuda(const DeviceTensor& A, const DeviceTensor& B, DeviceTensor& C,
     if (A.cols() != B.rows())
         throw std::invalid_argument("matmul_cuda: inner dimensions differ (A is " +
                                     shape_str(A) + ", B is " + shape_str(B) + ")");
-    const std::size_t m = A.rows(), n = B.cols(), k = A.cols();
+    if (C.rows() != A.rows() || C.cols() != B.cols()) C = DeviceTensor(A.rows(), B.cols());
+    matmul_cuda(A.rows(), B.cols(), A.cols(), A.data(), B.data(), C.data(), kernel);
+}
+
+void matmul_cuda(std::size_t m, std::size_t n, std::size_t k, const float* A, const float* B,
+                 float* C, GpuKernel kernel) {
+    const std::string shapes = "(A is " + std::to_string(m) + "x" + std::to_string(k) +
+                               ", B is " + std::to_string(k) + "x" + std::to_string(n) + ")";
     if (kernel == GpuKernel::automatic) {
         kernel = m <= kSkinnyMaxRows ? GpuKernel::skinny
                  : m <= 64           ? GpuKernel::tiled_split
                                      : GpuKernel::tiled;
     }
     if (kernel == GpuKernel::skinny && m > kSkinnyMaxRows)
-        throw std::invalid_argument("matmul_cuda: skinny kernel takes at most 8 rows, A is " +
-                                    shape_str(A));
+        throw std::invalid_argument("matmul_cuda: skinny kernel takes at most 8 rows " + shapes);
     // Kernels index with int.
     constexpr std::size_t kMaxElems = 1u << 31;
     if (m * k >= kMaxElems || k * n >= kMaxElems || m * n >= kMaxElems)
-        throw std::invalid_argument("matmul_cuda: more than 2^31 elements (A is " +
-                                    shape_str(A) + ", B is " + shape_str(B) + ")");
-    if (C.rows() != m || C.cols() != n) C = DeviceTensor(m, n);
+        throw std::invalid_argument("matmul_cuda: more than 2^31 elements " + shapes);
     if (m == 0 || n == 0) return;
     if (k == 0) {
-        check(cudaMemsetAsync(C.data(), 0, m * n * sizeof(float)), "memset");
+        cuda_check(cudaMemsetAsync(C, 0, m * n * sizeof(float)), "memset");
         return;
     }
 
     const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
     switch (kernel) {
         case GpuKernel::naive:
-            sgemm_naive<<<dim3(ceil_div(n, 16), ceil_div(m, 16)), dim3(16, 16)>>>(
-                mi, ni, ki, A.data(), B.data(), C.data());
+            sgemm_naive<<<dim3(ceil_div(n, 16), ceil_div(m, 16)), dim3(16, 16)>>>(mi, ni, ki, A,
+                                                                                   B, C);
             break;
         case GpuKernel::tiled:
-            run_tiled<128, 8>(mi, ni, ki, 1, A.data(), B.data(), C.data());
+            run_tiled<128, 8>(mi, ni, ki, 1, A, B, C);
             break;
         case GpuKernel::tiled_split:
-            run_tiled_split(mi, ni, ki, A.data(), B.data(), C.data());
+            run_tiled_split(mi, ni, ki, A, B, C);
             break;
         default:
-            run_skinny(mi, ni, ki, A.data(), B.data(), C.data());
+            run_skinny(mi, ni, ki, A, B, C);
             break;
     }
-    check(cudaGetLastError(), "launch");
+    cuda_check(cudaGetLastError(), "launch");
 }
 
 Tensor matmul_cuda(const Tensor& A, const Tensor& B, GpuKernel kernel) {
@@ -309,7 +312,9 @@ Tensor matmul_cuda(const Tensor& A, const Tensor& B, GpuKernel kernel) {
     return dC.download();
 }
 
-void cuda_synchronize() { check(cudaDeviceSynchronize(), "synchronize"); }
+std::size_t cuda_scratch_generation() { return g_scratch_generation; }
+
+void cuda_synchronize() { cuda_check(cudaDeviceSynchronize(), "synchronize"); }
 
 bool cuda_available() {
     int count = 0;

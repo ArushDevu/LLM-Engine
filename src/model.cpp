@@ -162,6 +162,35 @@ Checkpoint load_checkpoint(const std::string& path) {
     return ckpt;
 }
 
+void check_feed(const Config& cfg, const int* tokens, std::size_t n, std::size_t pos,
+                std::size_t filled) {
+    for (std::size_t i = 0; i < n; ++i) {
+        if (tokens[i] < 0 || static_cast<std::size_t>(tokens[i]) >= cfg.vocab_size)
+            throw std::out_of_range("forward: token " + std::to_string(tokens[i]) +
+                                    " outside vocab");
+    }
+    if (pos + n > cfg.seq_len || pos > filled)
+        throw std::out_of_range("forward: positions " + std::to_string(pos) + ".." +
+                                std::to_string(pos + n - 1) + " with " +
+                                std::to_string(filled) + " cached of " +
+                                std::to_string(cfg.seq_len));
+}
+
+void rope_tables(const Config& cfg, std::vector<float>& cos, std::vector<float>& sin) {
+    const std::size_t half = cfg.head_size() / 2;
+    cos.resize(cfg.seq_len * half);
+    sin.resize(cfg.seq_len * half);
+    for (std::size_t pos = 0; pos < cfg.seq_len; ++pos) {
+        for (std::size_t j = 0; j < half; ++j) {
+            const float freq = 1.0f / std::pow(10000.0f, static_cast<float>(2 * j) /
+                                                          static_cast<float>(cfg.head_size()));
+            const float angle = static_cast<float>(pos) * freq;
+            cos[pos * half + j] = std::cos(angle);
+            sin[pos * half + j] = std::sin(angle);
+        }
+    }
+}
+
 Transformer::Transformer(Checkpoint ckpt, WeightType type)
     : cfg_(ckpt.config), w_(std::move(ckpt.weights)), quantized_(type == WeightType::q8),
       x_(1, cfg_.dim), att_(1, cfg_.dim), hb_(1, cfg_.hidden_dim),
@@ -182,19 +211,7 @@ Transformer::Transformer(Checkpoint ckpt, WeightType type)
         key_cache_.emplace_back(cfg_.seq_len, cfg_.kv_dim());
         value_cache_.emplace_back(cfg_.seq_len, cfg_.kv_dim());
     }
-    // Same float expressions as llama2.c, so the angles match it bit for bit.
-    const std::size_t half = cfg_.head_size() / 2;
-    rope_cos_.resize(cfg_.seq_len * half);
-    rope_sin_.resize(cfg_.seq_len * half);
-    for (std::size_t pos = 0; pos < cfg_.seq_len; ++pos) {
-        for (std::size_t j = 0; j < half; ++j) {
-            const float freq = 1.0f / std::pow(10000.0f, static_cast<float>(2 * j) /
-                                                          static_cast<float>(cfg_.head_size()));
-            const float angle = static_cast<float>(pos) * freq;
-            rope_cos_[pos * half + j] = std::cos(angle);
-            rope_sin_[pos * half + j] = std::sin(angle);
-        }
-    }
+    rope_tables(cfg_, rope_cos_, rope_sin_);
 }
 
 void Transformer::attention(std::size_t l, std::size_t pos, const Tensor& qkv, Tensor& out) {
@@ -250,16 +267,7 @@ const std::vector<float>& Transformer::prefill(const std::vector<int>& tokens, s
 }
 
 const std::vector<float>& Transformer::run(const int* tokens, std::size_t n, std::size_t pos) {
-    for (std::size_t i = 0; i < n; ++i) {
-        if (tokens[i] < 0 || static_cast<std::size_t>(tokens[i]) >= cfg_.vocab_size)
-            throw std::out_of_range("forward: token " + std::to_string(tokens[i]) +
-                                    " outside vocab");
-    }
-    if (pos + n > cfg_.seq_len || pos > filled_)
-        throw std::out_of_range("forward: positions " + std::to_string(pos) + ".." +
-                                std::to_string(pos + n - 1) + " with " +
-                                std::to_string(filled_) + " cached of " +
-                                std::to_string(cfg_.seq_len));
+    check_feed(cfg_, tokens, n, pos, filled_);
 
     const std::size_t D = cfg_.dim, H = cfg_.hidden_dim, KV = cfg_.kv_dim();
     const std::size_t half = cfg_.head_size() / 2;

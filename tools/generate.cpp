@@ -8,6 +8,8 @@
 //     -p <float>  top-p (default 0.9)
 //     -s <int>    RNG seed (default: time)
 //     -w <type>   weight storage: f32 or q8 (int8, default f32)
+//     -d <device> cpu or gpu (default cpu; gpu needs an ENGINE_CUDA build and
+//                 f32 weights)
 //
 // Generation stops at seq_len or when the model emits BOS, which separates
 // stories in the training data. Timing goes to stderr so stdout is only text.
@@ -19,11 +21,15 @@
 #include <exception>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "model.h"
 #include "sampler.h"
 #include "tokenizer.h"
+#ifdef ENGINE_HAVE_CUDA
+#include "cuda_model.h"
+#endif
 
 namespace {
 
@@ -32,7 +38,8 @@ using Clock = std::chrono::steady_clock;
 [[noreturn]] void usage() {
     std::fprintf(stderr,
                  "usage: generate <checkpoint.bin> [-z tokenizer] [-i prompt] [-n steps]\n"
-                 "                [-t temperature] [-p top_p] [-s seed] [-w f32|q8]\n");
+                 "                [-t temperature] [-p top_p] [-s seed] [-w f32|q8]\n"
+                 "                [-d cpu|gpu]\n");
     std::exit(2);
 }
 
@@ -50,55 +57,12 @@ double ms_between(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
-} // namespace
-
-int main(int argc, char** argv) try {
-    if (argc < 2) usage();
-    const std::string ckpt_path = argv[1];
-    std::string tok_path, prompt;
-    std::size_t steps = 0;
-    float temperature = 1.0f, top_p = 0.9f;
-    auto seed = static_cast<std::uint64_t>(std::time(nullptr));
-    WeightType weights = WeightType::f32;
-
-    for (int i = 2; i < argc; i += 2) {
-        const std::string flag = argv[i];
-        if (i + 1 >= argc || flag.size() != 2 || flag[0] != '-') usage();
-        const char* val = argv[i + 1];
-        switch (flag[1]) {
-            case 'z': tok_path = val; break;
-            case 'i': prompt = val; break;
-            case 'n': steps = std::strtoul(val, nullptr, 10); break;
-            case 't': temperature = std::strtof(val, nullptr); break;
-            case 'p': top_p = std::strtof(val, nullptr); break;
-            case 's': seed = std::strtoull(val, nullptr, 10); break;
-            case 'w':
-                if (std::string(val) == "q8") {
-                    weights = WeightType::q8;
-                } else if (std::string(val) != "f32") {
-                    usage();
-                }
-                break;
-            default: usage();
-        }
-    }
-    if (tok_path.empty())
-        tok_path = (std::filesystem::path(ckpt_path).parent_path() / "tokenizer.bin").string();
-
-    const auto t_load = Clock::now();
-    Transformer model(load_checkpoint(ckpt_path), weights);
-    const Config& cfg = model.config();
-    const Tokenizer tokenizer(tok_path, cfg.vocab_size);
-    Sampler sampler(temperature, top_p, seed);
-    if (steps == 0 || steps > cfg.seq_len) steps = cfg.seq_len;
-
-    const std::vector<int> prompt_tokens = tokenizer.encode(prompt, true, false);
-    if (prompt_tokens.size() > steps) {
-        std::fprintf(stderr, "prompt is %zu tokens, more than %zu steps\n",
-                     prompt_tokens.size(), steps);
-        return 1;
-    }
-
+// Prefills the prompt, then samples until steps positions or BOS. Model is
+// Transformer or CudaTransformer.
+template <class Model>
+void generate(Model& model, const Tokenizer& tokenizer, Sampler& sampler,
+              const std::vector<int>& prompt_tokens, std::size_t steps,
+              Clock::time_point t_load) {
     // The whole prompt goes through in one prefill pass; generated tokens are
     // then fed one at a time.
     const auto t_start = Clock::now();
@@ -137,6 +101,85 @@ int main(int argc, char** argv) try {
                      1e3 / ms);
     }
     std::fprintf(stderr, "\n");
+}
+
+} // namespace
+
+int main(int argc, char** argv) try {
+    if (argc < 2) usage();
+    const std::string ckpt_path = argv[1];
+    std::string tok_path, prompt;
+    std::size_t steps = 0;
+    float temperature = 1.0f, top_p = 0.9f;
+    auto seed = static_cast<std::uint64_t>(std::time(nullptr));
+    WeightType weights = WeightType::f32;
+    bool gpu = false;
+
+    for (int i = 2; i < argc; i += 2) {
+        const std::string flag = argv[i];
+        if (i + 1 >= argc || flag.size() != 2 || flag[0] != '-') usage();
+        const char* val = argv[i + 1];
+        switch (flag[1]) {
+            case 'z': tok_path = val; break;
+            case 'i': prompt = val; break;
+            case 'n': steps = std::strtoul(val, nullptr, 10); break;
+            case 't': temperature = std::strtof(val, nullptr); break;
+            case 'p': top_p = std::strtof(val, nullptr); break;
+            case 's': seed = std::strtoull(val, nullptr, 10); break;
+            case 'w':
+                if (std::string(val) == "q8") {
+                    weights = WeightType::q8;
+                } else if (std::string(val) != "f32") {
+                    usage();
+                }
+                break;
+            case 'd':
+                if (std::string(val) == "gpu") {
+                    gpu = true;
+                } else if (std::string(val) != "cpu") {
+                    usage();
+                }
+                break;
+            default: usage();
+        }
+    }
+    if (tok_path.empty())
+        tok_path = (std::filesystem::path(ckpt_path).parent_path() / "tokenizer.bin").string();
+
+    if (gpu && weights != WeightType::f32) {
+        std::fprintf(stderr, "-d gpu supports only -w f32\n");
+        return 2;
+    }
+#ifndef ENGINE_HAVE_CUDA
+    if (gpu) {
+        std::fprintf(stderr, "-d gpu needs a build configured with -DENGINE_CUDA=ON\n");
+        return 2;
+    }
+#endif
+
+    const auto t_load = Clock::now();
+    Checkpoint ckpt = load_checkpoint(ckpt_path);
+    const Config cfg = ckpt.config;
+    const Tokenizer tokenizer(tok_path, cfg.vocab_size);
+    Sampler sampler(temperature, top_p, seed);
+    if (steps == 0 || steps > cfg.seq_len) steps = cfg.seq_len;
+
+    const std::vector<int> prompt_tokens = tokenizer.encode(prompt, true, false);
+    if (prompt_tokens.size() > steps) {
+        std::fprintf(stderr, "prompt is %zu tokens, more than %zu steps\n",
+                     prompt_tokens.size(), steps);
+        return 1;
+    }
+
+#ifdef ENGINE_HAVE_CUDA
+    if (gpu) {
+        CudaTransformer model(ckpt);
+        generate(model, tokenizer, sampler, prompt_tokens, steps, t_load);
+        return 0;
+    }
+#endif
+    Transformer model(std::move(ckpt), weights);
+    generate(model, tokenizer, sampler, prompt_tokens, steps, t_load);
 } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

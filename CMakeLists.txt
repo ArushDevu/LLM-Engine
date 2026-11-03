@@ -2,9 +2,11 @@ cmake_minimum_required(VERSION 3.20)
 
 # Default to Release. Set before project(): MSVC toolchains otherwise
 # initialize the build type to Debug there, and the old after-the-fact check
-# silently built /Od binaries.
+# silently built /Od binaries. FORCE because build trees configured by that
+# old check cache an empty build type, which a plain CACHE set keeps, leaving
+# them unoptimized.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
 project(llm_engine LANGUAGES CXX)
@@ -92,12 +94,15 @@ if(ENGINE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   set(CMAKE_CUDA_STANDARD 17)
 
-  add_library(engine_cuda src/cuda_matmul.cu)
+  add_library(engine_cuda src/cuda_matmul.cu src/cuda_model.cu)
   target_include_directories(engine_cuda PUBLIC src)
-  target_link_libraries(engine_cuda PUBLIC CUDA::cudart)
+  target_link_libraries(engine_cuda PUBLIC engine_core CUDA::cudart)
+  # Per-thread default stream: launches without an explicit stream can then
+  # be captured into a CUDA graph (the legacy default stream can't be).
   # C4211 fires on the stub code nvcc generates for kernels in an anonymous
   # namespace, not on anything in the source.
   target_compile_options(engine_cuda PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=$<IF:$<BOOL:${MSVC}>,/W4$<COMMA>/wd4211,-Wall>
                                $<$<BOOL:${ENGINE_WERROR}>:-Werror=all-warnings>>)
 
@@ -105,6 +110,15 @@ if(ENGINE_CUDA)
   target_link_libraries(test_cuda PRIVATE engine_cuda engine_core engine_warnings)
   add_test(NAME cuda COMMAND test_cuda)
   set_tests_properties(cuda PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_executable(test_cuda_model tests/test_cuda_model.cpp)
+  target_link_libraries(test_cuda_model PRIVATE engine_cuda engine_warnings)
+  add_test(NAME cuda_model COMMAND test_cuda_model)
+  set_tests_properties(cuda_model PROPERTIES SKIP_RETURN_CODE 77)
+
+  # -d gpu in generate.
+  target_link_libraries(generate PRIVATE engine_cuda)
+  target_compile_definitions(generate PRIVATE ENGINE_HAVE_CUDA)
 
   add_executable(bench_cuda bench/bench_cuda.cpp)
   target_link_libraries(bench_cuda PRIVATE engine_cuda CUDA::cublas engine_warnings)

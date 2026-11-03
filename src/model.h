@@ -59,6 +59,17 @@ Checkpoint load_checkpoint(const std::string& path);
 // fp32, since a token reads only its own row.
 enum class WeightType { f32, q8 };
 
+// Validates feeding tokens[0:n] at positions [pos, pos + n) to a model with
+// `filled` positions cached: throws std::out_of_range for a token outside the
+// vocabulary, a position at or past seq_len, or a skipped position. Shared by
+// the CPU and GPU models so they accept exactly the same calls.
+void check_feed(const Config& cfg, const int* tokens, std::size_t n, std::size_t pos,
+                std::size_t filled);
+
+// RoPE angles, seq_len x head_size / 2 each, computed with the same float
+// expressions as llama2.c so they match it bit for bit.
+void rope_tables(const Config& cfg, std::vector<float>& cos, std::vector<float>& sin);
+
 // Runs the model over positions fed in order. Keys and values of every
 // position fed so far are cached, so new tokens attend to the past without
 // recomputing it.
