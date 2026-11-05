@@ -24,7 +24,7 @@ struct CUgraphExec_st;  // cudaGraphExec_t, without including the CUDA headers
 class CudaTransformer {
 public:
     // Copies the weights to the GPU. Throws std::runtime_error on a CUDA
-    // error, or if seq_len is too long for attention's shared-memory scores.
+    // error or a shape attention_cuda() can't handle.
     explicit CudaTransformer(const Checkpoint& ckpt, WeightType type = WeightType::f32);
     ~CudaTransformer();
 
@@ -74,6 +74,7 @@ private:
     // Activations, rows_ rows each, grow-only; only the first n are used.
     std::size_t rows_ = 0, own_generation_ = 0;
     DeviceTensor x_, qkv_, att_, gu_, hb_;
+    DeviceTensor attn_scratch_;  // attention_cuda()'s partial softmaxes
     DeviceTensor logits_dev_;  // 1 x vocab_size
 
     // Pinned host buffers, so the copies can be graph nodes. feed is

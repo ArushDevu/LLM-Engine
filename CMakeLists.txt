@@ -94,7 +94,7 @@ if(ENGINE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   set(CMAKE_CUDA_STANDARD 17)
 
-  add_library(engine_cuda src/cuda_matmul.cu src/cuda_model.cu)
+  add_library(engine_cuda src/cuda_attention.cu src/cuda_matmul.cu src/cuda_model.cu)
   target_include_directories(engine_cuda PUBLIC src)
   target_link_libraries(engine_cuda PUBLIC engine_core CUDA::cudart)
   # Per-thread default stream: launches without an explicit stream can then
@@ -111,6 +111,11 @@ if(ENGINE_CUDA)
   add_test(NAME cuda COMMAND test_cuda)
   set_tests_properties(cuda PROPERTIES SKIP_RETURN_CODE 77)
 
+  add_executable(test_cuda_attention tests/test_cuda_attention.cpp)
+  target_link_libraries(test_cuda_attention PRIVATE engine_cuda engine_warnings)
+  add_test(NAME cuda_attention COMMAND test_cuda_attention)
+  set_tests_properties(cuda_attention PROPERTIES SKIP_RETURN_CODE 77)
+
   add_executable(test_cuda_model tests/test_cuda_model.cpp)
   target_link_libraries(test_cuda_model PRIVATE engine_cuda engine_warnings)
   add_test(NAME cuda_model COMMAND test_cuda_model)
@@ -122,4 +127,7 @@ if(ENGINE_CUDA)
 
   add_executable(bench_cuda bench/bench_cuda.cpp)
   target_link_libraries(bench_cuda PRIVATE engine_cuda CUDA::cublas engine_warnings)
+
+  add_executable(bench_attention bench/bench_attention.cpp)
+  target_link_libraries(bench_attention PRIVATE engine_cuda engine_warnings)
 endif()

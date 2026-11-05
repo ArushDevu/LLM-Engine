@@ -21,7 +21,7 @@ of the transformer is written by hand.
 - [x] CUDA matmul kernels
 - [x] CUDA forward pass: weights, KV cache and activations on the GPU
 - [x] int8 weights on the GPU
-- [ ] Faster GPU attention
+- [x] Faster GPU attention (split-KV)
 - [ ] Benchmarks vs llama.cpp
 
 ## Running a model
@@ -173,8 +173,8 @@ GCC build. Greedy and seeded sampled text are identical on GPU and CPU.
 `CudaTransformer` (`src/cuda_model.cu`) keeps the weights, KV cache and
 activations in GPU memory; a call uploads its position and token ids and
 downloads only the logits. Each layer runs the qkv matmul with RMSNorm
-fused in, RoPE plus the cache write, attention (one block per head and row,
-scores in shared memory), the output projection with the residual add fused
+fused in, RoPE plus the cache write, attention (split over positions for
+decode; see GPU attention below), the output projection with the residual add fused
 in, gate/up with RMSNorm fused in, SwiGLU, and the down projection with the
 second residual add.
 
@@ -208,9 +208,60 @@ and was slower (11.9 vs 9.8 us per call), so attention is unchanged.
 Where the 0.61 ms goes now: 213 us is the classifier and 160 us the layer
 matmuls, all reading weights at ~170 GB/s, so ~0.37 ms is the fp32 floor;
 attention is 58 us (6 blocks on 20 SMs, latency-bound); the rest is the
-small kernels and the gaps between ~68 graph nodes. Splitting attention
-over positions would fill the GPU. Attention keeps a row's scores in
-shared memory, which caps seq_len at ~12k.
+small kernels and the gaps between ~68 graph nodes. (Attention has since
+been split over positions; see below.)
+
+### GPU attention
+Decode attention was one block per head: 6 blocks on 20 SMs for stories15M,
+each thread reading its own key row, with the whole context's scores in
+shared memory (a ~12k seq_len cap). `src/cuda_attention.cu` now splits
+decode (up to 8 rows) flash-decoding style:
+
+- **Split over positions.** Block (head group, row, s) takes the s-th chunk
+  of the context (at least 32 positions, at most 128 chunks) and keeps only
+  that chunk's scores, so seq_len is no longer capped by shared memory. The
+  grid is sized for seq_len and chunks past the context exit at once, so
+  one captured graph still serves every position.
+- **Merge in the last block.** Each chunk writes its max, exp-sum and
+  unnormalized value sum; the block that finishes last (an atomic counter,
+  which it resets) rescales and adds them in chunk order. Results are
+  deterministic and no second kernel is launched. A context that fits one
+  chunk is written directly.
+- **Coalesced loads.** Keys: a group of head_size / 4 lanes (rounded to a
+  power of two) shares a position, loading float4s, and sums with shuffles.
+  Values: consecutive threads load consecutive float4s of a row.
+- **One block per kv head.** Grouped-query heads sharing a kv head (up to 8)
+  run in one block, so each key and value is read once, not once per head.
+
+Prefill (more rows) keeps the old kernel: rows x heads blocks already fill
+the GPU. Per call inside a CUDA graph, one query row, n_ctx = seq_len
+(`bench_attention`); GB/s counts keys and values read once:
+
+| Shape                     | n_ctx | Old            | Split           | Speed-up |
+|---------------------------|-------|----------------|-----------------|----------|
+| stories15M (6 x 48)       | 32    | 3.7 us         | 4.0 us          | 0.92x    |
+| stories15M (6 x 48)       | 256   | 12.6 us        | 6.5 us          | 1.94x    |
+| 7B MHA (32 x 128)         | 1024  | 315 us, 106 GB/s | 199 us, 169 GB/s | 1.58x |
+| 7B MHA (32 x 128)         | 4096  | 1308 us, 103 GB/s | 811 us, 166 GB/s | 1.61x |
+| 7B MHA (32 x 128)         | 16384 | n/a (cap)      | 3082 us, 174 GB/s | -      |
+| 8B GQA (32 x 128, 8 kv)   | 1024  | 129 us         | 21.7 us         | 5.96x    |
+| 8B GQA (32 x 128, 8 kv)   | 4096  | 664 us         | 215 us, 156 GB/s | 3.09x   |
+| 8B GQA (32 x 128, 8 kv)   | 16384 | n/a (cap)      | 795 us, 169 GB/s | -       |
+
+From 1k positions (past the 24 MB L2) the split kernel reads at the
+~170 GB/s DRAM ceiling; smaller caches stay in L2 between the benchmark's
+calls, so those rows beat it. Only a context of under ~32 positions is a
+little slower, where the old kernel was one block's worth of work anyway.
+Chunk sizes of 16-128 and caps of 64-128 chunks were all within noise past
+1k positions; 32 and 128 were best at 256.
+
+stories15M decodes at most 256 positions, so end to end the gain is small:
+seven interleaved runs, medians, fp32 0.677 -> 0.658 ms/tok, int8
+0.375 -> 0.368 ms/tok; prefill unchanged; greedy and seeded sampled text
+byte-identical. `test_cuda_attention` checks both kernels against a
+double-precision reference for MHA, GQA (1, 2, 4 and 8 heads per block) and
+MQA, 1-12 rows, contexts up to 20k, and that a repeated call gives the same
+bits.
 
 ### int8 weights on the GPU
 `-d gpu -w q8` stores the projections and classifier as int8 with the CPU's
@@ -358,6 +409,7 @@ cmake -S . -B build-cuda -G Ninja -DCMAKE_CXX_COMPILER=cl -DENGINE_CUDA=ON
 cmake --build build-cuda
 ctest --test-dir build-cuda   # CPU tests, GPU kernels and GPU model vs. the CPU
 build-cuda\bench_cuda
+build-cuda\bench_attention
 build-cuda\generate models\stories15M.bin -t 0 -d gpu
 ```
 

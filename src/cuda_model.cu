@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "cuda_attention.h"
 #include "cuda_util.cuh"
 #include "quant.h"
 
@@ -60,53 +61,6 @@ __global__ void rope_and_cache(int qkv_cols, int dim, int kv_dim, int head_size,
     }
 }
 
-// Causal attention, one block per (query head, row): row i, at position
-// feed[0] + i, attends to cached positions [0, feed[0] + i]. The query and
-// the scores live in shared memory (head_size + seq_len floats). Threads
-// split the positions for the scores and the head's dimensions for the
-// weighted sum of values, which reads each value row coalesced. (Splitting
-// the weighted sum across all 256 threads in head_size-wide groups, with a
-// final reduction, was slower: 11.9 vs 9.8 us per call.)
-__global__ void attention(int qkv_cols, int dim, int kv_dim, int head_size, int group,
-                          const int* feed, const float* qkv, const float* key_cache,
-                          const float* value_cache, float* out) {
-    extern __shared__ float smem[];
-    float* q = smem;
-    float* scores = smem + head_size;
-    const int h = blockIdx.x, i = blockIdx.y, n_ctx = feed[0] + i + 1;
-    const int kv_off = (h / group) * head_size;
-
-    const float* qg = qkv + static_cast<std::size_t>(i) * qkv_cols + h * head_size;
-    for (int d = threadIdx.x; d < head_size; d += blockDim.x) q[d] = qg[d];
-    __syncthreads();
-
-    const float scale = 1.0f / sqrtf(float(head_size));
-    float mx = -INFINITY;
-    for (int t = threadIdx.x; t < n_ctx; t += blockDim.x) {
-        const float* k = key_cache + static_cast<std::size_t>(t) * kv_dim + kv_off;
-        float dot = 0.0f;
-        for (int d = 0; d < head_size; ++d) dot += q[d] * k[d];
-        scores[t] = dot * scale;
-        mx = fmaxf(mx, scores[t]);
-    }
-    mx = block_reduce(mx, MaxOp{}, -INFINITY);
-    float sum = 0.0f;
-    for (int t = threadIdx.x; t < n_ctx; t += blockDim.x) {
-        scores[t] = expf(scores[t] - mx);
-        sum += scores[t];
-    }
-    // block_reduce's barriers also make every score visible below.
-    const float inv = 1.0f / block_reduce(sum, SumOp{}, 0.0f);
-
-    float* oh = out + static_cast<std::size_t>(i) * dim + h * head_size;
-    for (int d = threadIdx.x; d < head_size; d += blockDim.x) {
-        const float* v = value_cache + kv_off + d;
-        float acc = 0.0f;
-        for (int t = 0; t < n_ctx; ++t) acc += scores[t] * v[static_cast<std::size_t>(t) * kv_dim];
-        oh[d] = acc * inv;
-    }
-}
-
 // SwiGLU: hb[r][c] = silu(gu[r][c]) * gu[r][hidden + c].
 __global__ void swiglu(int rows, int hidden, const float* gu, float* hb) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -134,19 +88,21 @@ MatmulFusion residual() {
     return f;
 }
 
-// Shared memory for attention: the query and the scores.
-std::size_t attention_smem(const Config& c) {
-    return (c.head_size() + c.seq_len) * sizeof(float);
+AttentionShape attention_shape(const Config& c) {
+    const std::size_t kv = c.kv_dim();
+    return {int(c.n_heads), int(c.n_kv_heads), int(c.head_size()), int(c.seq_len),
+            c.dim + 2 * kv, kv, c.dim};
 }
 
 } // namespace
 
 CudaTransformer::CudaTransformer(const Checkpoint& ckpt, WeightType type)
     : cfg_(ckpt.config), quantized_(type == WeightType::q8) {
-    if (const std::size_t smem = attention_smem(cfg_); smem > 48 * 1024)
-        throw std::runtime_error("CudaTransformer: seq_len " + std::to_string(cfg_.seq_len) +
-                                 " needs " + std::to_string(smem) +
-                                 " bytes of attention scores, more than 48 KB");
+    try {
+        attention_check(attention_shape(cfg_));
+    } catch (const std::invalid_argument& e) {
+        throw std::runtime_error(std::string("CudaTransformer: ") + e.what());
+    }
 
     // The embedding stays fp32 either way, as on the CPU: a token reads only
     // its own row.
@@ -198,6 +154,9 @@ void CudaTransformer::reserve_rows(std::size_t n) {
     att_ = DeviceTensor(n, D);
     gu_ = DeviceTensor(n, 2 * H);
     hb_ = DeviceTensor(n, H);
+    const std::size_t scratch = attention_scratch_floats(attention_shape(cfg_), n);
+    attn_scratch_ = DeviceTensor(1, std::max<std::size_t>(1, scratch));
+    cuda_check(cudaMemset(attn_scratch_.data(), 0, scratch * sizeof(float)), "zero scratch");
     rows_ = n;
     ++own_generation_;
 }
@@ -286,8 +245,7 @@ void CudaTransformer::enqueue(std::size_t n) {
     // Per layer: qkv = rmsnorm(x) Wqkv; RoPE and the cache write; attention;
     // x += att Wo; gu = rmsnorm(x) W13; x += swiglu(gu) W2. The norms and
     // residual adds are fused into the matmuls (MatmulFusion).
-    const std::size_t smem = attention_smem(cfg_);
-    const int group = int(cfg_.n_heads / cfg_.n_kv_heads);
+    const AttentionShape shape = attention_shape(cfg_);
     for (std::size_t l = 0; l < cfg_.n_layers; ++l) {
         Layer& lw = layers_[l];
         project(n, x_.data(), lw.wqkv, qkv_.data(), rms(lw.rms_att));
@@ -295,10 +253,8 @@ void CudaTransformer::enqueue(std::size_t n) {
             int(qkv_cols), Di, KVi, hs, feed_dev_, rope_cos_.data(), rope_sin_.data(),
             qkv_.data(), key_cache_[l].data(), value_cache_[l].data());
         check_launch();
-        attention<<<dim3(unsigned(cfg_.n_heads), rows), kThreads, smem>>>(
-            int(qkv_cols), Di, KVi, hs, group, feed_dev_, qkv_.data(), key_cache_[l].data(),
-            value_cache_[l].data(), att_.data());
-        check_launch();
+        attention_cuda(shape, n, feed_dev_, qkv_.data(), key_cache_[l].data(),
+                       value_cache_[l].data(), att_.data(), attn_scratch_.data());
         project(n, att_.data(), lw.wo, x_.data(), residual());
         project(n, x_.data(), lw.w13, gu_.data(), rms(lw.rms_ffn));
         swiglu<<<ceil_div(n * H, kThreads), kThreads>>>(rows, Hi, gu_.data(), hb_.data());
