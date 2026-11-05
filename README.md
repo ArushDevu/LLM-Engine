@@ -20,7 +20,8 @@ of the transformer is written by hand.
 - [x] int8 weight quantization
 - [x] CUDA matmul kernels
 - [x] CUDA forward pass: weights, KV cache and activations on the GPU
-- [ ] int8 weights on the GPU; faster GPU attention
+- [x] int8 weights on the GPU
+- [ ] Faster GPU attention
 - [ ] Benchmarks vs llama.cpp
 
 ## Running a model
@@ -36,7 +37,7 @@ build/generate models/stories15M.bin -t 0.8 -p 0.9 -i "One day, Tom found a"
 
 `-t 0` is greedy; with no prompt it tells the familiar "Once upon a time,
 there was a little girl named Lily..." story. `-w q8` stores the weights as
-int8; `-d gpu` runs on the GPU (a CUDA build, fp32 only). Text goes to
+int8; `-d gpu` runs on the GPU (a CUDA build), with either weight type. Text goes to
 stdout, load time, prefill and decode speed to stderr.
 
 ## Benchmarks
@@ -207,10 +208,46 @@ and was slower (11.9 vs 9.8 us per call), so attention is unchanged.
 Where the 0.61 ms goes now: 213 us is the classifier and 160 us the layer
 matmuls, all reading weights at ~170 GB/s, so ~0.37 ms is the fp32 floor;
 attention is 58 us (6 blocks on 20 SMs, latency-bound); the rest is the
-small kernels and the gaps between ~68 graph nodes. int8 weights on the
-GPU would cut the floor, and splitting attention over positions would fill
-the GPU. Attention keeps a row's scores in shared memory, which caps
-seq_len at ~12k.
+small kernels and the gaps between ~68 graph nodes. Splitting attention
+over positions would fill the GPU. Attention keeps a row's scores in
+shared memory, which caps seq_len at ~12k.
+
+### int8 weights on the GPU
+`-d gpu -w q8` stores the projections and classifier as int8 with the CPU's
+per-output-channel scales (the embedding stays fp32). Every kernel is a
+template over B's element type and widens and scales int8 as it loads it,
+exactly as the CPU path does while packing, so the arithmetic stays fp32
+and the GPU agrees with the CPU int8 model to float rounding:
+`test_cuda_model` runs every decode and prefill check for both weight
+types, and greedy and seeded sampled text are identical on CPU and GPU.
+
+stories15M, seven interleaved runs of each, medians (this session ran ~10%
+slower than the fp32 table above):
+
+| GPU weights | Decode, ms / token | Prefill, 158 tok | Load   |
+|-------------|--------------------|------------------|--------|
+| fp32        | 0.669              | 7.3 ms           | 306 ms |
+| int8        | 0.342              | 8.2 ms           | 417 ms |
+
+Decode is 1.96x faster: the weights drop from ~61 MB to ~15 MB per token.
+Prefill is ~1 ms slower, since the tiled kernels are compute-bound and now
+also convert every B element they stage; load adds quantization on the host.
+
+The m x 4096 x 4096 product (`bench_cuda`, int8 column):
+
+| m  | fp32              | int8                         |
+|----|-------------------|------------------------------|
+| 1  | 0.387 ms          | 0.069 ms, 242 GB/s of int8   |
+| 4  | 0.395 ms          | 0.139 ms                     |
+| 8  | 0.425 ms          | 0.222 ms                     |
+| 16 | 0.568 ms          | 0.562 ms                     |
+| 64 | 0.704 ms          | 0.726 ms                     |
+
+At m = 1 the 16.8 MB of int8 fits in the 24 MB L2, so repeated runs beat
+the DRAM ceiling. From m = 4 the skinny kernel is bound by the int8-to-fp32
+conversion and the per-element scale, not by bytes; converting with
+integer tricks instead of I2F, or scaling once after the sum, is the next
+step there. m >= 16 is unchanged, already compute-bound.
 
 ### How the CPU matmul works
 `src/matmul.cpp` follows the Goto/BLIS structure:

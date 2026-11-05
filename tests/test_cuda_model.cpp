@@ -54,11 +54,12 @@ bool check_close(const std::vector<float>& gpu, const std::vector<float>& cpu, c
 
 // Decode over the whole context, then prefill in chunks of 1, 1 and 5 rows
 // (the skinny matmul and the split-tile path), a decode step on that cache,
-// and a whole-context prefill that rewinds over it.
-void test_matches_cpu(int heads, int kv_heads, bool shared) {
+// and a whole-context prefill that rewinds over it. With int8 weights both
+// models quantize the same way, so they still agree up to summation order.
+void test_matches_cpu(int heads, int kv_heads, bool shared, WeightType type) {
     const Checkpoint ckpt = load_random(heads, kv_heads, shared);
-    Transformer cpu(ckpt);
-    CudaTransformer gpu(ckpt);
+    Transformer cpu(ckpt, type);
+    CudaTransformer gpu(ckpt, type);
     const std::size_t T = ckpt.config.seq_len;
     const auto V = int(ckpt.config.vocab_size);
 
@@ -113,9 +114,11 @@ int main() try {
         std::puts("no CUDA device, skipping");
         return 77;
     }
-    test_matches_cpu(4, 4, true);   // multi-head, tied classifier
-    test_matches_cpu(4, 2, false);  // grouped-query, separate classifier
-    test_matches_cpu(4, 1, true);   // multi-query
+    for (WeightType type : {WeightType::f32, WeightType::q8}) {
+        test_matches_cpu(4, 4, true, type);   // multi-head, tied classifier
+        test_matches_cpu(4, 2, false, type);  // grouped-query, separate classifier
+        test_matches_cpu(4, 1, true, type);   // multi-query
+    }
     test_bad_inputs();
 
     if (failures) {

@@ -3,8 +3,10 @@
 #include "cuda_util.cuh"
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -15,16 +17,31 @@ std::string shape_str(const DeviceTensor& t) {
 
 constexpr int ceil_div(std::size_t x, int d) { return static_cast<int>((x + d - 1) / d); }
 
+// B is fp32, or int8 with one scale per column (null for fp32), as on the
+// CPU; the kernels are templates over the element type. int8 is widened and
+// scaled as it is loaded, so the arithmetic is fp32 either way and matches
+// matmul_parallel(), which dequantizes the same way when it packs B.
+template <class BT>
+__device__ __forceinline__ float load_b(const BT* __restrict__ B, int idx,
+                                        const float* __restrict__ scale, int col) {
+    if constexpr (std::is_same_v<BT, float>) {
+        return B[idx];
+    } else {
+        return static_cast<float>(B[idx]) * scale[col];
+    }
+}
+
 // Reference: thread (x, y) computes C[y][x]. Consecutive threads take
 // consecutive columns, so each step of the k loop reads B coalesced.
+template <class BT>
 __global__ void sgemm_naive(int m, int n, int k, const float* __restrict__ A,
-                            const float* __restrict__ B, float* __restrict__ C,
-                            bool accumulate) {
+                            const BT* __restrict__ B, const float* __restrict__ scale,
+                            float* __restrict__ C, bool accumulate) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
     if (row >= m || col >= n) return;
     float acc = 0.0f;
-    for (int p = 0; p < k; ++p) acc += A[row * k + p] * B[p * n + col];
+    for (int p = 0; p < k; ++p) acc += A[row * k + p] * load_b(B, p * n + col, scale, col);
     float* c = C + row * n + col;
     *c = accumulate ? *c + acc : acc;
 }
@@ -51,10 +68,11 @@ __global__ void sgemm_naive(int m, int n, int k, const float* __restrict__ A,
 constexpr int BN = 128, BK = 8, TN = 8;
 constexpr int kTiledThreads = 256;
 
-template <int BM, int TM, bool Split>
+template <int BM, int TM, bool Split, class BT>
 __global__ void __launch_bounds__(kTiledThreads)
 sgemm_tiled(int m, int n, int k, int span, const float* __restrict__ A,
-            const float* __restrict__ B, float* __restrict__ out, bool accumulate) {
+            const BT* __restrict__ B, const float* __restrict__ scale,
+            float* __restrict__ out, bool accumulate) {
     static_assert((BM / TM) * (BN / TN) == kTiledThreads, "one thread per sub-tile");
     __shared__ float As[BK][BM + 4];
     __shared__ float Bs[BK][BN];
@@ -78,7 +96,7 @@ sgemm_tiled(int m, int n, int k, int span, const float* __restrict__ A,
         for (int i = threadIdx.x; i < BK * BN; i += kTiledThreads) {
             const int r = i / BN, c = i % BN;
             const int gr = p0 + r, gc = col0 + c;
-            Bs[r][c] = gr < p_end && gc < n ? B[gr * n + gc] : 0.0f;
+            Bs[r][c] = gr < p_end && gc < n ? load_b(B, gr * n + gc, scale, gc) : 0.0f;
         }
         __syncthreads();
 #pragma unroll
@@ -121,19 +139,19 @@ sgemm_tiled(int m, int n, int k, int span, const float* __restrict__ A,
 constexpr int kSkinnyMaxRows = 8;
 constexpr int kSkinnyThreads = 256;
 
-template <int M, bool Norm>
+template <int M, bool Norm, class BT>
 __global__ void __launch_bounds__(kSkinnyThreads)
 sgemm_skinny(int n, int k, int span, const float* __restrict__ A,
-             const float* __restrict__ rms_weight, const float* __restrict__ B,
-             float* __restrict__ out, bool accumulate) {
+             const float* __restrict__ rms_weight, const BT* __restrict__ B,
+             const float* __restrict__ scale, float* __restrict__ out, bool accumulate) {
     // Before any thread drops out: block_reduce needs the whole block.
-    [[maybe_unused]] float scale[M];
+    [[maybe_unused]] float row_scale[M];
     if constexpr (Norm) {
 #pragma unroll
         for (int r = 0; r < M; ++r) {
             float ss = 0.0f;
             for (int j = threadIdx.x; j < k; j += blockDim.x) ss += A[r * k + j] * A[r * k + j];
-            scale[r] = 1.0f / sqrtf(block_reduce(ss, SumOp{}, 0.0f) / float(k) + kRmsEps);
+            row_scale[r] = 1.0f / sqrtf(block_reduce(ss, SumOp{}, 0.0f) / float(k) + kRmsEps);
         }
     }
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -141,11 +159,11 @@ sgemm_skinny(int n, int k, int span, const float* __restrict__ A,
     const int p0 = blockIdx.y * span, p1 = min(k, p0 + span);
     float acc[M] = {};
     for (int p = p0; p < p1; ++p) {
-        const float b = B[p * n + c];
+        const float b = load_b(B, p * n + c, scale, c);
 #pragma unroll
         for (int r = 0; r < M; ++r) {
             float a = A[r * k + p];
-            if constexpr (Norm) a = a * scale[r] * rms_weight[p];
+            if constexpr (Norm) a = a * row_scale[r] * rms_weight[p];
             acc[r] += a * b;
         }
     }
@@ -210,14 +228,15 @@ float* norm_buffer(std::size_t floats) {
     return s.get(floats);
 }
 
-template <bool Norm>
+template <bool Norm, class BT>
 void launch_skinny(int m, dim3 grid, int n, int k, int span, const float* A,
-                   const float* rms_weight, const float* B, float* out, bool accumulate) {
+                   const float* rms_weight, const BT* B, const float* scale, float* out,
+                   bool accumulate) {
     switch (m) {
 #define ENGINE_SKINNY_CASE(M)                                                                  \
     case M:                                                                                    \
-        sgemm_skinny<M, Norm><<<grid, kSkinnyThreads>>>(n, k, span, A, rms_weight, B, out,     \
-                                                     accumulate);                              \
+        sgemm_skinny<M, Norm><<<grid, kSkinnyThreads>>>(n, k, span, A, rms_weight, B, scale,   \
+                                                     out, accumulate);                         \
         break;
         ENGINE_SKINNY_CASE(1) ENGINE_SKINNY_CASE(2) ENGINE_SKINNY_CASE(3) ENGINE_SKINNY_CASE(4)
         ENGINE_SKINNY_CASE(5) ENGINE_SKINNY_CASE(6) ENGINE_SKINNY_CASE(7) ENGINE_SKINNY_CASE(8)
@@ -235,38 +254,41 @@ int sm_count() {
     return sms;
 }
 
-template <int BM, int TM>
-void run_tiled(int m, int n, int k, int slices, const float* A, const float* B, float* C,
-               bool accumulate) {
+template <int BM, int TM, class BT>
+void run_tiled(int m, int n, int k, int slices, const float* A, const BT* B, const float* scale,
+               float* C, bool accumulate) {
     const dim3 grid(ceil_div(n, BN), ceil_div(m, BM));
     const int span = ceil_div(std::size_t(ceil_div(k, slices)), BK) * BK;
     slices = ceil_div(k, span);
     if (slices == 1) {
-        sgemm_tiled<BM, TM, false><<<grid, kTiledThreads>>>(m, n, k, k, A, B, C, accumulate);
+        sgemm_tiled<BM, TM, false><<<grid, kTiledThreads>>>(m, n, k, k, A, B, scale, C,
+                                                            accumulate);
         return;
     }
     float* partial = partial_buffer(std::size_t(slices) * m * n);
-    sgemm_tiled<BM, TM, true><<<dim3(grid.x, grid.y, slices), kTiledThreads>>>(m, n, k, span, A,
-                                                                               B, partial, false);
+    sgemm_tiled<BM, TM, true><<<dim3(grid.x, grid.y, slices), kTiledThreads>>>(
+        m, n, k, span, A, B, scale, partial, false);
     sum_slices<<<ceil_div(std::size_t(m) * n, 256), 256>>>(m * n, slices, partial, C, accumulate);
 }
 
 // 32- or 64-row tiles, the smallest that m fills, with k split until there
 // are about 8 blocks per SM, each slice at least 256 deep.
-void run_tiled_split(int m, int n, int k, const float* A, const float* B, float* C,
-                     bool accumulate) {
+template <class BT>
+void run_tiled_split(int m, int n, int k, const float* A, const BT* B, const float* scale,
+                     float* C, bool accumulate) {
     const int rows = m <= 32 ? 32 : 64;
     const int blocks = ceil_div(n, BN) * ceil_div(std::size_t(m), rows);
     const int slices = std::max(1, std::min(ceil_div(8 * sm_count(), blocks), ceil_div(k, 256)));
     if (rows == 32) {
-        run_tiled<32, 2>(m, n, k, slices, A, B, C, accumulate);
+        run_tiled<32, 2>(m, n, k, slices, A, B, scale, C, accumulate);
     } else {
-        run_tiled<64, 4>(m, n, k, slices, A, B, C, accumulate);
+        run_tiled<64, 4>(m, n, k, slices, A, B, scale, C, accumulate);
     }
 }
 
-void run_skinny(int m, int n, int k, const float* A, const float* rms_weight, const float* B,
-                float* C, bool accumulate) {
+template <class BT>
+void run_skinny(int m, int n, int k, const float* A, const float* rms_weight, const BT* B,
+                const float* scale, float* C, bool accumulate) {
     // Aim for about 64 resident warps per SM over the whole grid, but keep
     // slices at least 32 rows of B deep so the partials stay a small
     // fraction of the traffic.
@@ -280,12 +302,63 @@ void run_skinny(int m, int n, int k, const float* A, const float* rms_weight, co
     const bool direct_accumulate = slices == 1 && accumulate;
     const dim3 grid(ceil_div(n, kSkinnyThreads), slices);
     if (rms_weight) {
-        launch_skinny<true>(m, grid, n, k, span, A, rms_weight, B, out, direct_accumulate);
+        launch_skinny<true>(m, grid, n, k, span, A, rms_weight, B, scale, out, direct_accumulate);
     } else {
-        launch_skinny<false>(m, grid, n, k, span, A, rms_weight, B, out, direct_accumulate);
+        launch_skinny<false>(m, grid, n, k, span, A, rms_weight, B, scale, out, direct_accumulate);
     }
     if (slices > 1)
         sum_slices<<<ceil_div(std::size_t(m) * n, 256), 256>>>(m * n, slices, out, C, accumulate);
+}
+
+template <class BT>
+void matmul_impl(std::size_t m, std::size_t n, std::size_t k, const float* A, const BT* B,
+                 const float* scale, float* C, GpuKernel kernel, const MatmulFusion& fusion) {
+    auto shapes = [&] {
+        return "(A is " + std::to_string(m) + "x" + std::to_string(k) + ", B is " +
+               std::to_string(k) + "x" + std::to_string(n) + ")";
+    };
+    if (kernel == GpuKernel::automatic) {
+        kernel = m <= kSkinnyMaxRows ? GpuKernel::skinny
+                 : m <= 64           ? GpuKernel::tiled_split
+                                     : GpuKernel::tiled;
+    }
+    if (kernel == GpuKernel::skinny && m > kSkinnyMaxRows)
+        throw std::invalid_argument("matmul_cuda: skinny kernel takes at most 8 rows " +
+                                    shapes());
+    // Kernels index with int.
+    constexpr std::size_t kMaxElems = std::size_t{1} << 31;
+    if (m * k >= kMaxElems || k * n >= kMaxElems || m * n >= kMaxElems)
+        throw std::invalid_argument("matmul_cuda: more than 2^31 elements " + shapes());
+    if (m == 0 || n == 0) return;
+    if (k == 0) {
+        if (!fusion.accumulate) cuda_check(cudaMemsetAsync(C, 0, m * n * sizeof(float)), "memset");
+        return;
+    }
+
+    const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
+    const float* rms_weight = fusion.rms_weight;
+    if (rms_weight && kernel != GpuKernel::skinny) {
+        float* a = norm_buffer(m * k);
+        rmsnorm_rows<<<mi, 256>>>(ki, A, rms_weight, a);
+        A = a;
+        rms_weight = nullptr;
+    }
+    switch (kernel) {
+        case GpuKernel::naive:
+            sgemm_naive<<<dim3(ceil_div(n, 16), ceil_div(m, 16)), dim3(16, 16)>>>(
+                mi, ni, ki, A, B, scale, C, fusion.accumulate);
+            break;
+        case GpuKernel::tiled:
+            run_tiled<128, 8>(mi, ni, ki, 1, A, B, scale, C, fusion.accumulate);
+            break;
+        case GpuKernel::tiled_split:
+            run_tiled_split(mi, ni, ki, A, B, scale, C, fusion.accumulate);
+            break;
+        default:
+            run_skinny(mi, ni, ki, A, rms_weight, B, scale, C, fusion.accumulate);
+            break;
+    }
+    cuda_check(cudaGetLastError(), "launch");
 }
 
 } // namespace
@@ -326,6 +399,45 @@ Tensor DeviceTensor::download() const {
     return t;
 }
 
+DeviceQTensor::DeviceQTensor(const QTensor& t) : rows_(t.rows), cols_(t.cols) {
+    if (t.data.size() != rows_ * cols_ || t.scale.size() != cols_)
+        throw std::invalid_argument("DeviceQTensor: data or scale size doesn't match the shape");
+    try {
+        if (!t.data.empty()) {
+            cuda_check(cudaMalloc(&data_, t.data.size()), "alloc");
+            cuda_check(cudaMemcpy(data_, t.data.data(), t.data.size(), cudaMemcpyHostToDevice),
+                       "upload");
+        }
+        if (!t.scale.empty()) {
+            cuda_check(cudaMalloc(&scale_, t.scale.size() * sizeof(float)), "alloc");
+            cuda_check(cudaMemcpy(scale_, t.scale.data(), t.scale.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice),
+                       "upload");
+        }
+    } catch (...) {
+        cudaFree(data_);
+        cudaFree(scale_);
+        throw;
+    }
+}
+
+DeviceQTensor::~DeviceQTensor() {
+    cudaFree(data_);
+    cudaFree(scale_);
+}
+
+DeviceQTensor::DeviceQTensor(DeviceQTensor&& other) noexcept
+    : rows_(std::exchange(other.rows_, 0)), cols_(std::exchange(other.cols_, 0)),
+      data_(std::exchange(other.data_, nullptr)), scale_(std::exchange(other.scale_, nullptr)) {}
+
+DeviceQTensor& DeviceQTensor::operator=(DeviceQTensor&& other) noexcept {
+    std::swap(rows_, other.rows_);
+    std::swap(cols_, other.cols_);
+    std::swap(data_, other.data_);
+    std::swap(scale_, other.scale_);
+    return *this;
+}
+
 void matmul_cuda(const DeviceTensor& A, const DeviceTensor& B, DeviceTensor& C,
                  GpuKernel kernel) {
     if (A.cols() != B.rows())
@@ -337,58 +449,32 @@ void matmul_cuda(const DeviceTensor& A, const DeviceTensor& B, DeviceTensor& C,
 
 void matmul_cuda(std::size_t m, std::size_t n, std::size_t k, const float* A, const float* B,
                  float* C, GpuKernel kernel, const MatmulFusion& fusion) {
-    auto shapes = [&] {
-        return "(A is " + std::to_string(m) + "x" + std::to_string(k) + ", B is " +
-               std::to_string(k) + "x" + std::to_string(n) + ")";
-    };
-    if (kernel == GpuKernel::automatic) {
-        kernel = m <= kSkinnyMaxRows ? GpuKernel::skinny
-                 : m <= 64           ? GpuKernel::tiled_split
-                                     : GpuKernel::tiled;
-    }
-    if (kernel == GpuKernel::skinny && m > kSkinnyMaxRows)
-        throw std::invalid_argument("matmul_cuda: skinny kernel takes at most 8 rows " +
-                                    shapes());
-    // Kernels index with int.
-    constexpr std::size_t kMaxElems = std::size_t{1} << 31;
-    if (m * k >= kMaxElems || k * n >= kMaxElems || m * n >= kMaxElems)
-        throw std::invalid_argument("matmul_cuda: more than 2^31 elements " + shapes());
-    if (m == 0 || n == 0) return;
-    if (k == 0) {
-        if (!fusion.accumulate) cuda_check(cudaMemsetAsync(C, 0, m * n * sizeof(float)), "memset");
-        return;
-    }
+    matmul_impl(m, n, k, A, B, static_cast<const float*>(nullptr), C, kernel, fusion);
+}
 
-    const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
-    const float* rms_weight = fusion.rms_weight;
-    if (rms_weight && kernel != GpuKernel::skinny) {
-        float* a = norm_buffer(m * k);
-        rmsnorm_rows<<<mi, 256>>>(ki, A, rms_weight, a);
-        A = a;
-        rms_weight = nullptr;
-    }
-    switch (kernel) {
-        case GpuKernel::naive:
-            sgemm_naive<<<dim3(ceil_div(n, 16), ceil_div(m, 16)), dim3(16, 16)>>>(
-                mi, ni, ki, A, B, C, fusion.accumulate);
-            break;
-        case GpuKernel::tiled:
-            run_tiled<128, 8>(mi, ni, ki, 1, A, B, C, fusion.accumulate);
-            break;
-        case GpuKernel::tiled_split:
-            run_tiled_split(mi, ni, ki, A, B, C, fusion.accumulate);
-            break;
-        default:
-            run_skinny(mi, ni, ki, A, rms_weight, B, C, fusion.accumulate);
-            break;
-    }
-    cuda_check(cudaGetLastError(), "launch");
+void matmul_cuda(std::size_t m, std::size_t n, std::size_t k, const float* A,
+                 const std::int8_t* B, const float* scale, float* C, GpuKernel kernel,
+                 const MatmulFusion& fusion) {
+    matmul_impl(m, n, k, A, B, scale, C, kernel, fusion);
 }
 
 Tensor matmul_cuda(const Tensor& A, const Tensor& B, GpuKernel kernel) {
     const DeviceTensor dA(A), dB(B);
     DeviceTensor dC;
     matmul_cuda(dA, dB, dC, kernel);
+    return dC.download();
+}
+
+Tensor matmul_cuda(const Tensor& A, const QTensor& B, GpuKernel kernel) {
+    if (A.cols != B.rows)
+        throw std::invalid_argument("matmul_cuda: inner dimensions differ (A is " +
+                                    std::to_string(A.rows) + "x" + std::to_string(A.cols) +
+                                    ", B is " + std::to_string(B.rows) + "x" +
+                                    std::to_string(B.cols) + ")");
+    const DeviceTensor dA(A);
+    const DeviceQTensor dB(B);
+    DeviceTensor dC(A.rows, B.cols);
+    matmul_cuda(A.rows, B.cols, A.cols, dA.data(), dB.data(), dB.scale(), dC.data(), kernel);
     return dC.download();
 }
 

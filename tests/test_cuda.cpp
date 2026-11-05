@@ -11,6 +11,7 @@
 #include "cuda_matmul.h"
 #include "matmul.h"
 #include "ops.h"
+#include "quant.h"
 
 namespace {
 
@@ -161,9 +162,55 @@ void test_fusion() {
     }
 }
 
+// int8 B on every kernel, plain and with each fusion, against the fp32
+// reference on the dequantized weights: the kernels dequantize as they load,
+// so the only difference left is summation order.
+void test_q8() {
+    std::mt19937 rng(11);
+    for (const Shape& s : kShapes) {
+        const Tensor A = random_tensor(s.m, s.k, rng);
+        const QTensor Bq = quantize_q8(random_tensor(s.k, s.n, rng));
+        const Tensor want = matmul_naive(A, dequantize(Bq));
+        for (const Kernel& k : kKernels) {
+            if (s.m > k.max_m) continue;
+            if (!close_to(matmul_cuda(A, Bq, k.kernel), want, s.k)) {
+                std::fprintf(stderr, "  [%s] q8 mismatch at m=%zu k=%zu n=%zu\n", k.name, s.m,
+                             s.k, s.n);
+                CHECK(false);
+            }
+        }
+    }
+
+    for (const Shape& s : {Shape{1, 288, 300}, Shape{5, 768, 288}, Shape{70, 40, 130}}) {
+        const Tensor A = random_tensor(s.m, s.k, rng);
+        const QTensor Bq = quantize_q8(random_tensor(s.k, s.n, rng));
+        const Tensor C0 = random_tensor(s.m, s.n, rng);
+        const Tensor w_host = random_tensor(1, s.k, rng);
+        const DeviceTensor dA(A), dW(w_host);
+        const DeviceQTensor dB(Bq);
+        MatmulFusion f;
+        f.accumulate = true;
+        f.rms_weight = dW.data();
+        const Tensor want = add(C0, matmul_naive(rmsnorm(A, w_host.data), dequantize(Bq)));
+        for (const Kernel& k : kKernels) {
+            if (s.m > k.max_m) continue;
+            DeviceTensor dC(C0);
+            matmul_cuda(s.m, s.n, s.k, dA.data(), dB.data(), dB.scale(), dC.data(), k.kernel, f);
+            if (!close_to(dC.download(), want, 2 * s.k)) {
+                std::fprintf(stderr, "  [%s] q8 fused mismatch at m=%zu k=%zu n=%zu\n", k.name,
+                             s.m, s.k, s.n);
+                CHECK(false);
+            }
+        }
+    }
+}
+
 void test_bad_shapes() {
     const std::string msg = invalid_argument_of([] { matmul_cuda(Tensor(2, 3), Tensor(4, 2)); });
     CHECK(msg.find("2x3") != std::string::npos && msg.find("4x2") != std::string::npos);
+    CHECK(!invalid_argument_of([] {
+               matmul_cuda(Tensor(2, 3), quantize_q8(Tensor(4, 2)));
+           }).empty());
     CHECK(!invalid_argument_of([] {
                matmul_cuda(Tensor(9, 2), Tensor(2, 2), GpuKernel::skinny);
            }).empty());
@@ -180,6 +227,7 @@ int main() try {
     test_against_reference();
     test_reuse();
     test_fusion();
+    test_q8();
     test_bad_shapes();
     cuda_synchronize();
 

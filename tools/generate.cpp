@@ -8,8 +8,7 @@
 //     -p <float>  top-p (default 0.9)
 //     -s <int>    RNG seed (default: time)
 //     -w <type>   weight storage: f32 or q8 (int8, default f32)
-//     -d <device> cpu or gpu (default cpu; gpu needs an ENGINE_CUDA build and
-//                 f32 weights)
+//     -d <device> cpu or gpu (default cpu; gpu needs an ENGINE_CUDA build)
 //
 // Generation stops at seq_len or when the model emits BOS, which separates
 // stories in the training data. Timing goes to stderr so stdout is only text.
@@ -146,10 +145,6 @@ int main(int argc, char** argv) try {
     if (tok_path.empty())
         tok_path = (std::filesystem::path(ckpt_path).parent_path() / "tokenizer.bin").string();
 
-    if (gpu && weights != WeightType::f32) {
-        std::fprintf(stderr, "-d gpu supports only -w f32\n");
-        return 2;
-    }
 #ifndef ENGINE_HAVE_CUDA
     if (gpu) {
         std::fprintf(stderr, "-d gpu needs a build configured with -DENGINE_CUDA=ON\n");
@@ -173,7 +168,7 @@ int main(int argc, char** argv) try {
 
 #ifdef ENGINE_HAVE_CUDA
     if (gpu) {
-        CudaTransformer model(ckpt);
+        CudaTransformer model(ckpt, weights);
         generate(model, tokenizer, sampler, prompt_tokens, steps, t_load);
         return 0;
     }

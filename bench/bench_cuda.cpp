@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "cuda_matmul.h"
+#include "quant.h"
 
 namespace {
 
@@ -110,13 +111,18 @@ int main() try {
 
     constexpr std::size_t kDim = 4096;
     std::printf("\nm x %zu times %zu x %zu; cells are ms / GB/s of B. 'with copies' also\n"
-                "uploads A and downloads C (B stays on the GPU, as weights would)\n\n",
+                "uploads A and downloads C (B stays on the GPU, as weights would). int8\n"
+                "is B quantized (-w q8), GB/s of its int8 bytes\n\n",
                 kDim, kDim, kDim);
-    std::printf("%6s | %17s | %17s | %17s\n", "m", "engine", "cuBLAS", "engine with copies");
-    std::printf("-------+-------------------+-------------------+------------------\n");
+    std::printf("%6s | %17s | %17s | %17s | %17s\n", "m", "engine", "cuBLAS",
+                "engine with copies", "engine int8");
+    std::printf("-------+-------------------+-------------------+-------------------+"
+                "------------------\n");
     const Tensor W = random_tensor(kDim, kDim, rng);
     const DeviceTensor dW(W);
+    const DeviceQTensor dWq(quantize_q8(W));
     const double w_bytes = double(W.data.size() * sizeof(float));
+    const double wq_bytes = double(W.data.size());
     for (std::size_t m : {1, 4, 8, 16, 32, 64}) {
         const Tensor X = random_tensor(m, kDim, rng);
         DeviceTensor dX(X), dC(m, kDim);
@@ -129,9 +135,12 @@ int main() try {
                 dC.download();
             },
             101);
-        std::printf("%6zu | %8.3f %8.1f | %8.3f %8.1f | %8.3f %8.1f\n", m, ours * 1e3,
-                    w_bytes / ours / 1e9, blas * 1e3, w_bytes / blas / 1e9, copies * 1e3,
-                    w_bytes / copies / 1e9);
+        const double q8 = median_seconds(
+            [&] { matmul_cuda(m, kDim, kDim, dX.data(), dWq.data(), dWq.scale(), dC.data()); },
+            101);
+        std::printf("%6zu | %8.3f %8.1f | %8.3f %8.1f | %8.3f %8.1f | %8.3f %8.1f\n", m,
+                    ours * 1e3, w_bytes / ours / 1e9, blas * 1e3, w_bytes / blas / 1e9,
+                    copies * 1e3, w_bytes / copies / 1e9, q8 * 1e3, wq_bytes / q8 / 1e9);
     }
     cublasDestroy(handle);
 } catch (const std::exception& e) {

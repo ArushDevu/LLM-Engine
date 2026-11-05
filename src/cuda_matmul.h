@@ -1,9 +1,10 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 
 #include "tensor.h"
 
-// fp32 matmul on an NVIDIA GPU. Built only with -DENGINE_CUDA=ON. Calls run
+// Matmul on an NVIDIA GPU, fp32 activations times fp32 or int8 weights. Built only with -DENGINE_CUDA=ON. Calls run
 // on the calling thread's default stream (the library is compiled with
 // --default-stream per-thread, so that stream can be captured into a CUDA
 // graph) and return before the GPU finishes, except download() and the
@@ -36,6 +37,30 @@ public:
 private:
     std::size_t rows_ = 0, cols_ = 0;
     float* data_ = nullptr;
+};
+
+// int8 matrix with one fp32 scale per column in GPU memory, as QTensor.
+// Move-only; frees its memory on destruction.
+class DeviceQTensor {
+public:
+    DeviceQTensor() = default;
+    explicit DeviceQTensor(const QTensor& t);  // copies t to the GPU
+    ~DeviceQTensor();
+
+    DeviceQTensor(DeviceQTensor&& other) noexcept;
+    DeviceQTensor& operator=(DeviceQTensor&& other) noexcept;
+    DeviceQTensor(const DeviceQTensor&) = delete;
+    DeviceQTensor& operator=(const DeviceQTensor&) = delete;
+
+    std::size_t rows() const { return rows_; }
+    std::size_t cols() const { return cols_; }
+    const std::int8_t* data() const { return data_; }
+    const float* scale() const { return scale_; }
+
+private:
+    std::size_t rows_ = 0, cols_ = 0;
+    std::int8_t* data_ = nullptr;
+    float* scale_ = nullptr;  // cols
 };
 
 enum class GpuKernel {
@@ -73,6 +98,14 @@ void matmul_cuda(std::size_t m, std::size_t n, std::size_t k, const float* A, co
                  float* C, GpuKernel kernel = GpuKernel::automatic,
                  const MatmulFusion& fusion = {});
 
+// Same with int8 B: C = A x dequantize(B), B k x n int8 with n column
+// scales. Every kernel widens and scales B as it loads it, so B is read at a
+// quarter of the fp32 bytes and the arithmetic matches matmul_parallel()'s
+// int8 path.
+void matmul_cuda(std::size_t m, std::size_t n, std::size_t k, const float* A,
+                 const std::int8_t* B, const float* scale, float* C,
+                 GpuKernel kernel = GpuKernel::automatic, const MatmulFusion& fusion = {});
+
 // Bumped whenever matmul_cuda() reallocates its internal split-K scratch. A
 // CUDA graph captured before the bump points at freed memory and must be
 // captured again.
@@ -80,6 +113,7 @@ std::size_t cuda_scratch_generation();
 
 // Copies A and B to the GPU, multiplies, copies C back.
 Tensor matmul_cuda(const Tensor& A, const Tensor& B, GpuKernel kernel = GpuKernel::automatic);
+Tensor matmul_cuda(const Tensor& A, const QTensor& B, GpuKernel kernel = GpuKernel::automatic);
 
 // Waits for all queued GPU work; throws std::runtime_error if any failed.
 void cuda_synchronize();

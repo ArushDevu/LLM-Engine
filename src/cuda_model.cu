@@ -7,6 +7,7 @@
 #include <string>
 
 #include "cuda_util.cuh"
+#include "quant.h"
 
 namespace {
 
@@ -140,19 +141,31 @@ std::size_t attention_smem(const Config& c) {
 
 } // namespace
 
-CudaTransformer::CudaTransformer(const Checkpoint& ckpt) : cfg_(ckpt.config) {
+CudaTransformer::CudaTransformer(const Checkpoint& ckpt, WeightType type)
+    : cfg_(ckpt.config), quantized_(type == WeightType::q8) {
     if (const std::size_t smem = attention_smem(cfg_); smem > 48 * 1024)
         throw std::runtime_error("CudaTransformer: seq_len " + std::to_string(cfg_.seq_len) +
                                  " needs " + std::to_string(smem) +
                                  " bytes of attention scores, more than 48 KB");
 
+    // The embedding stays fp32 either way, as on the CPU: a token reads only
+    // its own row.
+    auto proj = [&](const Tensor& t) {
+        Proj p;
+        if (quantized_) {
+            p.q8 = DeviceQTensor(quantize_q8(t));
+        } else {
+            p.f32 = DeviceTensor(t);
+        }
+        return p;
+    };
     const Weights& w = ckpt.weights;
     token_embedding_ = DeviceTensor(w.token_embedding);
     rms_final_ = upload(w.rms_final);
-    wcls_ = DeviceTensor(w.wcls);
+    wcls_ = proj(w.wcls);
     for (const LayerWeights& lw : w.layers) {
-        layers_.push_back({upload(lw.rms_att), DeviceTensor(lw.wqkv), DeviceTensor(lw.wo),
-                           upload(lw.rms_ffn), DeviceTensor(lw.w13), DeviceTensor(lw.w2)});
+        layers_.push_back({upload(lw.rms_att), proj(lw.wqkv), proj(lw.wo), upload(lw.rms_ffn),
+                           proj(lw.w13), proj(lw.w2)});
         key_cache_.emplace_back(cfg_.seq_len, cfg_.kv_dim());
         value_cache_.emplace_back(cfg_.seq_len, cfg_.kv_dim());
     }
@@ -187,6 +200,17 @@ void CudaTransformer::reserve_rows(std::size_t n) {
     hb_ = DeviceTensor(n, H);
     rows_ = n;
     ++own_generation_;
+}
+
+void CudaTransformer::project(std::size_t n, const float* in, const Proj& w, float* out,
+                              const MatmulFusion& fusion) const {
+    if (quantized_) {
+        matmul_cuda(n, w.q8.cols(), w.q8.rows(), in, w.q8.data(), w.q8.scale(), out,
+                    GpuKernel::automatic, fusion);
+    } else {
+        matmul_cuda(n, w.f32.cols(), w.f32.rows(), in, w.f32.data(), out, GpuKernel::automatic,
+                    fusion);
+    }
 }
 
 std::size_t CudaTransformer::buffers_generation() const {
@@ -252,7 +276,6 @@ void CudaTransformer::enqueue(std::size_t n) {
     const int Di = int(D), Hi = int(H), KVi = int(KV), hs = int(cfg_.head_size());
     const int rows = int(n);
     cudaStream_t stream = cudaStreamPerThread;
-    const GpuKernel kAuto = GpuKernel::automatic;
 
     cuda_check(cudaMemcpyAsync(feed_dev_, feed_host_, (n + 1) * sizeof(int),
                                cudaMemcpyHostToDevice, stream),
@@ -267,8 +290,7 @@ void CudaTransformer::enqueue(std::size_t n) {
     const int group = int(cfg_.n_heads / cfg_.n_kv_heads);
     for (std::size_t l = 0; l < cfg_.n_layers; ++l) {
         Layer& lw = layers_[l];
-        matmul_cuda(n, qkv_cols, D, x_.data(), lw.wqkv.data(), qkv_.data(), kAuto,
-                    rms(lw.rms_att));
+        project(n, x_.data(), lw.wqkv, qkv_.data(), rms(lw.rms_att));
         rope_and_cache<<<dim3(ceil_div(D / 2 + KV / 2 + KV, kThreads), rows), kThreads>>>(
             int(qkv_cols), Di, KVi, hs, feed_dev_, rope_cos_.data(), rope_sin_.data(),
             qkv_.data(), key_cache_[l].data(), value_cache_[l].data());
@@ -277,16 +299,15 @@ void CudaTransformer::enqueue(std::size_t n) {
             int(qkv_cols), Di, KVi, hs, group, feed_dev_, qkv_.data(), key_cache_[l].data(),
             value_cache_[l].data(), att_.data());
         check_launch();
-        matmul_cuda(n, D, D, att_.data(), lw.wo.data(), x_.data(), kAuto, residual());
-        matmul_cuda(n, 2 * H, D, x_.data(), lw.w13.data(), gu_.data(), kAuto, rms(lw.rms_ffn));
+        project(n, att_.data(), lw.wo, x_.data(), residual());
+        project(n, x_.data(), lw.w13, gu_.data(), rms(lw.rms_ffn));
         swiglu<<<ceil_div(n * H, kThreads), kThreads>>>(rows, Hi, gu_.data(), hb_.data());
         check_launch();
-        matmul_cuda(n, D, H, hb_.data(), lw.w2.data(), x_.data(), kAuto, residual());
+        project(n, hb_.data(), lw.w2, x_.data(), residual());
     }
 
     // Only the last row's logits are returned.
-    matmul_cuda(1, cfg_.vocab_size, D, x_.data() + (n - 1) * D, wcls_.data(), logits_dev_.data(),
-                kAuto, rms(rms_final_));
+    project(1, x_.data() + (n - 1) * D, wcls_, logits_dev_.data(), rms(rms_final_));
     cuda_check(cudaMemcpyAsync(logits_host_, logits_dev_.data(), cfg_.vocab_size * sizeof(float),
                                cudaMemcpyDeviceToHost, stream),
                "download logits");
