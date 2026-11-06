@@ -295,10 +295,29 @@ The m x 4096 x 4096 product (`bench_cuda`, int8 column):
 | 64 | 0.704 ms          | 0.726 ms                     |
 
 At m = 1 the 16.8 MB of int8 fits in the 24 MB L2, so repeated runs beat
-the DRAM ceiling. From m = 4 the skinny kernel is bound by the int8-to-fp32
-conversion and the per-element scale, not by bytes; converting with
-integer tricks instead of I2F, or scaling once after the sum, is the next
-step there. m >= 16 is unchanged, already compute-bound.
+the DRAM ceiling. m >= 16 is unchanged, already compute-bound.
+
+**Four columns per thread.** The skinny kernel above loaded one byte per
+thread per step, so a warp read just 32 bytes of a row of B at a time.
+When 4 divides n (every stories15M shape), int8 B now goes to a variant
+where each thread takes 4 consecutive columns as one 32-bit load (128 bytes
+per warp), sums raw int8 values, and scales each column's sum once at the
+end, as the CPU streaming path does. Same run, old and new kernel:
+
+| m  | One column / thread | Four columns / thread      | Speed-up |
+|----|---------------------|----------------------------|----------|
+| 1  | 0.060 ms            | 0.034 ms, 492 GB/s (in L2) | 1.76x    |
+| 4  | 0.131 ms            | 0.068 ms                   | 1.93x    |
+| 8  | 0.214 ms            | 0.121 ms                   | 1.77x    |
+
+The wider load is the gain: scaling per element in the new kernel costs
+only ~3%. Eight and sixteen columns per thread were slower (m = 4: 0.117
+and 0.176 ms), with fewer threads in flight and M x V accumulators each.
+stories15M int8 decode 0.311 -> 0.283 ms/tok (seven interleaved runs,
+medians); fp32 unchanged; greedy and seeded sampled text byte-identical.
+Prefill is unchanged (3.7 ms for 77 tokens with `CUDA_MODULE_LOADING=EAGER`);
+under the default lazy loading the reported prefill also includes loading
+each kernel on first use, ~2 ms of it.
 
 ### How the CPU matmul works
 `src/matmul.cpp` follows the Goto/BLIS structure:

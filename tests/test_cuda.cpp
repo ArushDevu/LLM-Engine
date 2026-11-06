@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <iterator>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "cuda_matmul.h"
 #include "matmul.h"
@@ -167,7 +169,11 @@ void test_fusion() {
 // so the only difference left is summation order.
 void test_q8() {
     std::mt19937 rng(11);
-    for (const Shape& s : kShapes) {
+    // Plus shapes for the skinny kernel's 4-column path (4 | n): a partial
+    // last block, and one k slice (C written directly).
+    std::vector<Shape> shapes(std::begin(kShapes), std::end(kShapes));
+    shapes.insert(shapes.end(), {{3, 100, 1028}, {8, 1000, 4100}, {6, 20, 36}, {1, 4096, 4}});
+    for (const Shape& s : shapes) {
         const Tensor A = random_tensor(s.m, s.k, rng);
         const QTensor Bq = quantize_q8(random_tensor(s.k, s.n, rng));
         const Tensor want = matmul_naive(A, dequantize(Bq));
@@ -181,7 +187,8 @@ void test_q8() {
         }
     }
 
-    for (const Shape& s : {Shape{1, 288, 300}, Shape{5, 768, 288}, Shape{70, 40, 130}}) {
+    for (const Shape& s : {Shape{1, 288, 300}, Shape{5, 768, 288}, Shape{2, 20, 64},
+                           Shape{3, 288, 30}, Shape{70, 40, 130}}) {
         const Tensor A = random_tensor(s.m, s.k, rng);
         const QTensor Bq = quantize_q8(random_tensor(s.k, s.n, rng));
         const Tensor C0 = random_tensor(s.m, s.n, rng);
