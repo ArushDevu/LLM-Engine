@@ -126,18 +126,35 @@ sgemm_tiled(int m, int n, int k, int span, const float* __restrict__ A,
 
 // Skinny path, m <= 8: the GPU analogue of the CPU's split-K streaming path.
 // With so few rows each element of B is used at most 8 times, so the product
-// is bound by reading B. Thread c of a k slice streams column c of that
-// slice; a warp reads 32 consecutive floats of a row of B per step. n
-// columns alone are too few threads to keep enough loads in flight, so k is
-// split across blockIdx.y and the slices' partial sums are added by a second
-// kernel, in a fixed order (no atomics, so results are deterministic).
+// is bound by reading B. A block is 32 column threads by 8 warps: lane l of
+// every warp owns the same columns, and each warp streams its own range of
+// the block's k, so a warp reads 32 consecutive elements of a row of B per
+// step. The warps' sums are added in shared memory in warp order, so no
+// partials leave the block.
+//
+// That replaced splitting k across blocks for every product (blockIdx.y,
+// with a sum_slices kernel adding the slices): a stories15M token ran 25 of
+// those adds, ~1.3 us each, and folding them into the product instead, the
+// last block to finish adding the slices after an atomic count, made each
+// product ~2.5 us slower (fence, atomic and L2 reads are one serial chain).
+// k is still split across blocks, with sum_slices, when deep k leaves the
+// grid too few warps to keep loads in flight (see run_skinny).
 //
 // With Norm, the skinny kernel also applies MatmulFusion's RMSNorm while it
 // reads A, so a decode step needs no separate norm kernel: each block first
 // computes its rows' scales over all of k (A is at most 8 rows), which cost
 // +0.6 us on a 5-10 us product against a 1.7 us kernel saved.
+//
+// V is the columns per thread. int8 B with 4 | n takes V = 4: a thread loads
+// 4 consecutive columns as one 32-bit word, so a warp reads 128 bytes, not
+// 32 (m = 1-8 products 1.7-2x faster); 8 or 16 columns were slower, with
+// fewer threads in flight and M x V accumulators. Those columns keep their
+// scales over all of k, so the thread sums raw int8 values and scales once
+// at the end, as the CPU streaming path does. V = 1 scales as it loads.
 constexpr int kSkinnyMaxRows = 8;
-constexpr int kSkinnyThreads = 256;
+constexpr int kSkinnyWarps = 8;  // k ranges per block
+constexpr int kSkinnyThreads = 32 * kSkinnyWarps;
+constexpr int kQ8Cols = 4;
 
 // RMSNorm scales of A's M rows over all of k. Call before any thread drops
 // out: block_reduce needs the whole block.
@@ -152,70 +169,71 @@ __device__ __forceinline__ void rms_row_scales(const float* __restrict__ A, int 
     }
 }
 
-template <int M, bool Norm, class BT>
+// Row p's V columns of B from column c: scaled for V = 1, raw for int8 V = 4.
+template <int V, class BT>
+__device__ __forceinline__ void load_cols(const BT* __restrict__ B, int idx,
+                                          const float* __restrict__ scale, int c, float (&b)[V]) {
+    if constexpr (V == 1) {
+        b[0] = load_b(B, idx, scale, c);
+    } else {
+        static_assert(V == kQ8Cols && std::is_same_v<BT, std::int8_t>, "4 int8 columns");
+        const int w = __ldg(reinterpret_cast<const int*>(B + idx));
+#pragma unroll
+        for (int j = 0; j < V; ++j) b[j] = static_cast<float>((w << (24 - 8 * j)) >> 24);
+    }
+}
+
+// Writes the block's M x (32 * V) sums to out + (blockIdx.y * M + r) * n:
+// C itself when k isn't split across blocks (adding to it if accumulate),
+// else that slice's partials.
+template <int M, int V, bool Norm, class BT>
 __global__ void __launch_bounds__(kSkinnyThreads)
 sgemm_skinny(int n, int k, int span, const float* __restrict__ A,
              const float* __restrict__ rms_weight, const BT* __restrict__ B,
              const float* __restrict__ scale, float* __restrict__ out, bool accumulate) {
+    // Warps 1.. leave their sums here; [j][lane] so the stores don't conflict.
+    __shared__ float red[kSkinnyWarps - 1][M][V][32];
     [[maybe_unused]] float row_scale[M];
     if constexpr (Norm) rms_row_scales<M>(A, k, row_scale);
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= n) return;
-    const int p0 = blockIdx.y * span, p1 = min(k, p0 + span);
-    float acc[M] = {};
-    for (int p = p0; p < p1; ++p) {
-        const float b = load_b(B, p * n + c, scale, c);
-#pragma unroll
-        for (int r = 0; r < M; ++r) {
-            float a = A[r * k + p];
-            if constexpr (Norm) a = a * row_scale[r] * rms_weight[p];
-            acc[r] += a * b;
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < M; ++r) {
-        float* o = out + (blockIdx.y * M + r) * n + c;
-        *o = accumulate ? *o + acc[r] : acc[r];
-    }
-}
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int c = (blockIdx.x * 32 + lane) * V;
+    const bool active = c < n;
 
-// The skinny kernel for int8 B when 4 divides n. One byte per thread per
-// step left each warp reading only 32 bytes of a row of B at a time; here a
-// thread takes 4 consecutive columns as one 32-bit load, so a warp reads 128
-// (m = 1-8 products 1.7-2x faster). 8 or 16 columns per thread were slower:
-// fewer threads in flight and M x V accumulators. A thread's columns keep
-// their scales over the whole k loop, so it sums raw int8 values and scales
-// each sum once at the end, as the CPU streaming path does (~3% of the gain).
-constexpr int kQ8Cols = 4;
-
-template <int M, bool Norm>
-__global__ void __launch_bounds__(kSkinnyThreads)
-sgemm_skinny_q8(int n, int k, int span, const float* __restrict__ A,
-                const float* __restrict__ rms_weight, const std::int8_t* __restrict__ B,
-                const float* __restrict__ scale, float* __restrict__ out, bool accumulate) {
-    constexpr int V = kQ8Cols;
-    [[maybe_unused]] float row_scale[M];
-    if constexpr (Norm) rms_row_scales<M>(A, k, row_scale);
-    const int c = (blockIdx.x * blockDim.x + threadIdx.x) * V;
-    if (c >= n) return;
-    const int p0 = blockIdx.y * span, p1 = min(k, p0 + span);
+    const int b0 = blockIdx.y * span, b1 = min(k, b0 + span);
+    const int wspan = (span + kSkinnyWarps - 1) / kSkinnyWarps;
+    const int p0 = b0 + warp * wspan, p1 = min(b1, p0 + wspan);
     float acc[M][V] = {};
-    for (int p = p0; p < p1; ++p) {
-        const int w = __ldg(reinterpret_cast<const int*>(B + p * n + c));
-        float b[V];
+    if (active) {
+        for (int p = p0; p < p1; ++p) {
+            float b[V];
+            load_cols<V>(B, p * n + c, scale, c, b);
 #pragma unroll
-        for (int j = 0; j < V; ++j) b[j] = static_cast<float>((w << (24 - 8 * j)) >> 24);
+            for (int r = 0; r < M; ++r) {
+                float a = A[r * k + p];
+                if constexpr (Norm) a = a * row_scale[r] * rms_weight[p];
 #pragma unroll
-        for (int r = 0; r < M; ++r) {
-            float a = A[r * k + p];
-            if constexpr (Norm) a = a * row_scale[r] * rms_weight[p];
-#pragma unroll
-            for (int j = 0; j < V; ++j) acc[r][j] += a * b[j];
+                for (int j = 0; j < V; ++j) acc[r][j] += a * b[j];
+            }
         }
     }
+    if (warp > 0) {
+#pragma unroll
+        for (int r = 0; r < M; ++r)
+#pragma unroll
+            for (int j = 0; j < V; ++j) red[warp - 1][r][j][lane] = acc[r][j];
+    }
+    __syncthreads();
+    if (warp > 0 || !active) return;
+#pragma unroll
+    for (int w = 0; w < kSkinnyWarps - 1; ++w)
+#pragma unroll
+        for (int r = 0; r < M; ++r)
+#pragma unroll
+            for (int j = 0; j < V; ++j) acc[r][j] += red[w][r][j][lane];
 #pragma unroll
     for (int j = 0; j < V; ++j) {
-        const float s = scale[c + j];
+        if (c + j >= n) break;
+        const float s = V > 1 ? scale[c + j] : 1.0f;
 #pragma unroll
         for (int r = 0; r < M; ++r) {
             float* o = out + (blockIdx.y * M + r) * n + c + j;
@@ -278,7 +296,7 @@ float* norm_buffer(std::size_t floats) {
     return s.get(floats);
 }
 
-// vec: int8 B with 4 | n and aligned, run by sgemm_skinny_q8.
+// vec: int8 B with 4 | n and aligned, run with 4 columns per thread.
 template <bool Norm, class BT>
 void launch_skinny(int m, dim3 grid, int n, int k, int span, const float* A,
                    const float* rms_weight, const BT* B, const float* scale, float* out,
@@ -288,13 +306,13 @@ void launch_skinny(int m, dim3 grid, int n, int k, int span, const float* A,
     case M:                                                                                    \
         if constexpr (std::is_same_v<BT, std::int8_t>) {                                       \
             if (vec) {                                                                         \
-                sgemm_skinny_q8<M, Norm><<<grid, kSkinnyThreads>>>(n, k, span, A, rms_weight,  \
-                                                                B, scale, out, accumulate);    \
+                sgemm_skinny<M, kQ8Cols, Norm><<<grid, kSkinnyThreads>>>(                      \
+                    n, k, span, A, rms_weight, B, scale, out, accumulate);                     \
                 break;                                                                         \
             }                                                                                  \
         }                                                                                      \
-        sgemm_skinny<M, Norm><<<grid, kSkinnyThreads>>>(n, k, span, A, rms_weight, B, scale,   \
-                                                     out, accumulate);                         \
+        sgemm_skinny<M, 1, Norm><<<grid, kSkinnyThreads>>>(n, k, span, A, rms_weight, B,       \
+                                                        scale, out, accumulate);               \
         break;
         ENGINE_SKINNY_CASE(1) ENGINE_SKINNY_CASE(2) ENGINE_SKINNY_CASE(3) ENGINE_SKINNY_CASE(4)
         ENGINE_SKINNY_CASE(5) ENGINE_SKINNY_CASE(6) ENGINE_SKINNY_CASE(7) ENGINE_SKINNY_CASE(8)
@@ -350,20 +368,23 @@ void run_skinny(int m, int n, int k, const float* A, const float* rms_weight, co
     // Four-byte loads need every row of B 4-byte aligned.
     const bool vec = std::is_same_v<BT, std::int8_t> && n % kQ8Cols == 0 &&
                      reinterpret_cast<std::uintptr_t>(B) % kQ8Cols == 0;
-    const int col_threads = vec ? n / kQ8Cols : n;
+    const int strips = ceil_div(std::size_t(vec ? n / kQ8Cols : n), 32);
 
-    // Aim for about 64 resident warps per SM over the whole grid, but keep
-    // slices at least 32 rows of B deep so the partials stay a small
-    // fraction of the traffic.
-    const int want_threads = sm_count() * 2048;
-    int slices = std::max(1, std::min(want_threads / std::max(col_threads, 1), ceil_div(k, 32)));
+    // Split k across blocks too, until the grid has ~256 warps per SM, while
+    // every warp still streams at least 32 rows of B. That is several waves
+    // of resident blocks, so the last one's idle SMs cost little: at 64 per
+    // SM, 4 x 4096^2 ran one full wave and a nearly empty one, 0.46 ms
+    // against 0.39. k = 288 (every stories15M product but w2) fits one slice.
+    const int want_warps = sm_count() * 256;
+    int slices =
+        std::max(1, std::min(want_warps / (strips * kSkinnyWarps), k / (kSkinnyWarps * 32)));
     const int span = ceil_div(k, slices);
     slices = ceil_div(k, span);
 
     // With one slice the kernel writes C itself, accumulating if asked.
     float* out = slices == 1 ? C : partial_buffer(std::size_t(slices) * m * n);
     const bool direct_accumulate = slices == 1 && accumulate;
-    const dim3 grid(ceil_div(std::size_t(col_threads), kSkinnyThreads), slices);
+    const dim3 grid(strips, slices);
     if (rms_weight) {
         launch_skinny<true>(m, grid, n, k, span, A, rms_weight, B, scale, out, direct_accumulate,
                             vec);

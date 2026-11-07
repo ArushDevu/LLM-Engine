@@ -150,11 +150,13 @@ How the kernels work (`src/cuda_matmul.cu`):
 - **Split tiles (9 <= m <= 64).** The same kernel with 32- or 64-row tiles
   and k split across `blockIdx.z` until there are ~8 blocks per SM. With
   128-row tiles, m = 64 ran at 1.29 ms on 32 blocks; split, 0.72 ms.
-- **Skinny (m <= 8).** One thread per column of C streams its column of a k
-  slice, so each warp reads 128 contiguous bytes of a row of B per step; k is
-  split so ~64 warps per SM keep loads in flight. Partial sums go to a
-  scratch buffer and a second kernel adds them in a fixed order, so results
-  are deterministic (no atomics).
+- **Skinny (m <= 8).** A block is 32 column threads by 8 warps: each warp
+  streams its own range of k for the same 32 columns, reading 128
+  contiguous bytes of a row of B per step, and the warps' sums are added in
+  shared memory. For deep k (m x 4096^2) k is also split across blocks
+  until there are ~256 warps per SM; those partials go to a scratch buffer
+  and a second kernel adds them. Every sum runs in a fixed order, so
+  results are deterministic (no atomics).
 
 Known limits: tiled is at 53-60% of cuBLAS (next: float4 loads,
 double-buffered shared memory, warp tiles); m = 16-64 trails cuBLAS by
@@ -318,6 +320,45 @@ medians); fp32 unchanged; greedy and seeded sampled text byte-identical.
 Prefill is unchanged (3.7 ms for 77 tokens with `CUDA_MODULE_LOADING=EAGER`);
 under the default lazy loading the reported prefill also includes loading
 each kernel on first use, ~2 ms of it.
+
+### Split-K inside the block
+The skinny kernel used to split k only across blocks (one thread per column
+per block), so every decode product was two graph nodes: the product, then
+`sum_slices` adding its slices, ~1.3 us each, 25 of a token's 69 kernels.
+Nsight Systems, graph nodes traced, int8:
+
+| Skinny split-K                       | GPU time / token | Kernels / token |
+|--------------------------------------|------------------|-----------------|
+| Across blocks + `sum_slices`         | 159.7 us         | 69              |
+| Last block to finish adds the slices | 190 us           | 44              |
+| Across the warps of a block          | 153.3 us         | 50              |
+
+Folding the add into the product, flash-decoding style (as attention does),
+was slower: each product grew ~2.5 us, because the last block's fence,
+atomic and L2 reads of the partials form one serial chain, twice the
+kernel it removed. Splitting inside the block keeps the partials in shared
+memory: 8 warps take 8 ranges of k for the same 32 columns. Every k = 288
+product now runs as a single kernel; w2 (k = 768) still splits 3 ways
+across blocks, which measured faster for int8 (3 column strips, so 3
+blocks, on 20 SMs) and within noise for fp32.
+
+The cross-block split targets ~256 warps per SM, up from 64: with blocks
+of 8 warps, 64 per SM put 4 x 4096^2 at one full wave plus a nearly empty
+one (0.46 ms against 0.38 before). Same run, old and new (`bench_cuda`,
+m x 4096 x 4096):
+
+| m | fp32 old | fp32 new | int8 old | int8 new |
+|---|----------|----------|----------|----------|
+| 1 | 0.374 ms | 0.375 ms | 0.032 ms | 0.032 ms |
+| 4 | 0.381 ms | 0.384 ms | 0.066 ms | 0.059 ms |
+| 8 | 0.401 ms | 0.403 ms | 0.124 ms | 0.099 ms |
+
+stories15M decode, interleaved runs, medians: fp32 0.578 -> 0.541 ms/tok
+(seven runs), int8 0.300 -> 0.288 (eleven; this session ran ~5% slower than
+the int8 table above); GPU time per token fp32 476 -> 434 us. Greedy and
+seeded sampled text byte-identical, prefill untouched (m > 8 uses the tiled
+kernels). `test_cuda` adds queued back-to-back products over every split
+path and checks repeats give the same bits.
 
 ### How the CPU matmul works
 `src/matmul.cpp` follows the Goto/BLIS structure:

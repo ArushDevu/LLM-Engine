@@ -68,7 +68,7 @@ enum class GpuKernel {
     naive,        // one thread per element of C; the reference
     tiled,        // 128 x 128 shared-memory tiles, 8 x 8 per thread
     tiled_split,  // 32 x 128 tiles, 2 x 8 per thread, k split across blocks
-    skinny,       // m <= 8 only: split-K, one thread per column of C
+    skinny,       // m <= 8 only: k split across warps (and blocks for deep k)
 };
 
 // C = A x B; C is reallocated if it isn't m x n. Throws std::invalid_argument

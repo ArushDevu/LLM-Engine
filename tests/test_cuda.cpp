@@ -212,6 +212,68 @@ void test_q8() {
     }
 }
 
+// The skinny kernel splits k across the warps of a block (summed in shared
+// memory) and, for deep k, across blocks (summed by sum_slices through the
+// shared partial buffer). Queue products that take each path back to back,
+// with no host sync between them (shapes here: 1 to 16 block slices, one
+// or many column strips, V = 1 and 4), and check each against the reference
+// and that repeats give the same bits: every sum runs in a fixed order.
+void test_split_k_queue() {
+    std::mt19937 rng(13);
+    struct Case {
+        Shape s;
+        bool q8, accumulate;
+    };
+    const Case cases[] = {
+        {{1, 4096, 4096}, false, false}, {{8, 4096, 4100}, true, true},
+        {{1, 288, 32000}, true, false},  {{3, 768, 288}, false, true},
+        {{1, 288, 864}, true, true},     {{5, 1000, 70}, true, false},
+    };
+    constexpr int kRepeats = 3;
+    for (int round = 0; round < 2; ++round) {
+        std::vector<DeviceTensor> outs;
+        std::vector<Tensor> wants;
+        std::vector<DeviceTensor> keep_a, keep_b;
+        std::vector<DeviceQTensor> keep_q;
+        for (const Case& c : cases) {
+            const Tensor A = random_tensor(c.s.m, c.s.k, rng);
+            const Tensor B = random_tensor(c.s.k, c.s.n, rng);
+            const Tensor C0 = random_tensor(c.s.m, c.s.n, rng);
+            const QTensor Bq = quantize_q8(B);
+            const Tensor prod = matmul_naive(A, c.q8 ? dequantize(Bq) : B);
+            keep_a.emplace_back(A);
+            if (c.q8) {
+                keep_q.emplace_back(Bq);
+            } else {
+                keep_b.emplace_back(B);
+            }
+            MatmulFusion f;
+            f.accumulate = c.accumulate;
+            for (int r = 0; r < kRepeats; ++r) {
+                outs.emplace_back(C0);
+                if (c.q8) {
+                    matmul_cuda(c.s.m, c.s.n, c.s.k, keep_a.back().data(), keep_q.back().data(),
+                                keep_q.back().scale(), outs.back().data(), GpuKernel::skinny, f);
+                } else {
+                    matmul_cuda(c.s.m, c.s.n, c.s.k, keep_a.back().data(), keep_b.back().data(),
+                                outs.back().data(), GpuKernel::skinny, f);
+                }
+                wants.push_back(c.accumulate ? add(C0, prod) : prod);
+            }
+        }
+        for (std::size_t i = 0; i < outs.size(); ++i) {
+            const Tensor got = outs[i].download();
+            const Case& c = cases[i / kRepeats];
+            if (!close_to(got, wants[i], 2 * c.s.k)) {
+                std::fprintf(stderr, "  split-K queue mismatch at m=%zu k=%zu n=%zu%s\n", c.s.m,
+                             c.s.k, c.s.n, c.q8 ? " (q8)" : "");
+                CHECK(false);
+            }
+            if (i % kRepeats) CHECK(got.data == outs[i - 1].download().data);
+        }
+    }
+}
+
 void test_bad_shapes() {
     const std::string msg = invalid_argument_of([] { matmul_cuda(Tensor(2, 3), Tensor(4, 2)); });
     CHECK(msg.find("2x3") != std::string::npos && msg.find("4x2") != std::string::npos);
@@ -235,6 +297,7 @@ int main() try {
     test_reuse();
     test_fusion();
     test_q8();
+    test_split_k_queue();
     test_bad_shapes();
     cuda_synchronize();
 
